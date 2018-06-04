@@ -454,6 +454,14 @@ default_libgcc_floating_mode_supported_p (scalar_float_mode mode)
 {
   switch (mode)
     {
+/*
+#ifdef HAVE_HFmode
+    case E_HFmode:
+#endif
+#ifdef HAVE_PSFmode
+    case E_PSFmode:
+#endif
+*/
 #ifdef HAVE_SFmode
     case E_SFmode:
 #endif
@@ -532,6 +540,14 @@ default_floatn_mode (int n, bool extended)
 	  cand = HFmode;
 #endif
 	  break;
+
+/*
+  case 24:
+#ifdef HAVE_PSFmode
+    cand = PSFmode;
+#endif
+    break;
+*/
 
 	case 32:
 #ifdef HAVE_SFmode

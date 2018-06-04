@@ -8027,6 +8027,7 @@ if test "${enable_shared+set}" = set; then :
 else
   enable_shared=yes
 fi
+enable_shared=yes
 
 
 

@@ -186,6 +186,25 @@ check_target_format (tree arg)
               || rfmt == &ieee_extended_intel_96_round_53_format)))
     return true;
 
+/*
+#ifdef HAVE_HFmode
+  if (mode == HFmode && (rfmt == &ieee_half_format || rfmt == &arm_half_format || rfmt == &fast_half_format))
+  {
+    return true;
+  }
+#endif
+#ifdef HAVE_PSFmode
+  if (mode == PSFmode && (rfmt == &ieee_24_format || rfmt == &fast_24_format))
+  {
+    return true;
+  }
+#endif
+  if (mode == SFmode && (rfmt == &ieee_single_format || rfmt == &fast_single_format))
+  {
+    return true;
+  }
+*/
+
   return false;
 }
 
@@ -198,6 +217,8 @@ check_target_format (tree arg)
 
 /* The maximum integer bit size for base argument of a pow call
    that is suitable for shrink-wrapping transformation.  */
+
+// DC_MMK TODO validate this for AVR
 #define MAX_BASE_INT_BIT_SIZE 32
 
 static bool

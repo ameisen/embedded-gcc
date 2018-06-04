@@ -115,7 +115,7 @@ LIB2FUNCS_EXCLUDE = \
 # We do not have the DF type.
 # Most of the C functions in libgcc2 use almost all registers,
 # so use -mcall-prologues for smaller code size.
-HOST_LIBGCC2_CFLAGS += -DDF=SF -Dinhibit_libc -mcall-prologues -Os
+HOST_LIBGCC2_CFLAGS += -DDF=SF -Dinhibit_libc
 
 # Extra 16-bit integer functions.
 intfuncs16 = _absvXX2 _addvXX3 _subvXX3 _mulvXX3 _negvXX2 _clrsbXX2
@@ -290,3 +290,5 @@ LIB2FUNCS_EXCLUDE += \
 LIB2FUNCS_EXCLUDE += \
 	$(foreach func,_ssmul,\
 	$(foreach mode,$(ssmul_modes),$(func_X)))
+
+LIB2ADD_ST += $(srcdir)/config/avr/flt_ops.cpp

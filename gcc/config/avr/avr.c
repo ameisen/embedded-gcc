@@ -18,6 +18,10 @@
    along with GCC; see the file COPYING3.  If not see
    <http://www.gnu.org/licenses/>.  */
 
+#define EXPERIMENTAL_VOLATILE 1
+#define EXPERIMENTAL_COMPARISON 1
+#define DEBUG_WARNINGS 1
+
 #define IN_TARGET_CODE 1
 
 #include "config.h"
@@ -60,6 +64,32 @@
 
 /* This file should be included last.  */
 #include "target-def.h"
+
+#if DEBUG_WARNINGS
+# define debug_warn(op, str, ...) \
+{ \
+  tree decl = SYMBOL_REF_DECL(op); \
+  bool found_location = false; \
+  location_t location; \
+  if (decl) \
+  { \
+    location = DECL_SOURCE_LOCATION(decl); \
+    if (location != UNKNOWN_LOCATION) \
+    { \
+      found_location = true; \
+    } \
+  } \
+  if (!found_location) \
+  { \
+    location = curr_insn_location(); \
+  } \
+  char buffer[2048] = {'\0'}; \
+  sprintf(buffer, str, ##__VA_ARGS__); \
+  warning_at(location, 0, buffer); \
+}
+#else
+# define debug_Warn(op, str, ...)
+#endif
 
 /* Maximal allowed offset for an address in the LD command */
 #define MAX_LD_OFFSET(MODE) (64 - (signed)GET_MODE_SIZE (MODE))
@@ -337,6 +367,189 @@ static const pass_data avr_pass_data_casesi =
   0              // todo_flags_finish
 };
 
+//template <bool mask>
+//unsigned int extract_address(rtx x)
+//{
+//  x = plus_constant(GET_MODE(x), x, 0);
+//
+//  switch (GET_CODE(x))
+//  {
+//  case REG:
+//    return -1;
+//  case PRE_DEC:
+//    return -1;
+//  case POST_INC:
+//    return -1;
+//  default:
+//    if (CONSTANT_ADDRESS_P(x))
+//    {
+//      if (GET_CODE(x) == CONST)
+//      {
+//        x = XEXP(x, 0);
+//        if (GET_CODE(x) == PLUS && CONST_INT_P(XEXP(x, 1)))
+//        {
+//          x = XEXP(x, 0);
+//        }
+//      }
+//    }
+//    else
+//    {
+//    }
+//  }
+//}
+
+template <bool mask>
+bool validate_address_io(rtx x, unsigned int address)
+{
+  static const char * const name_str = mask ? "masked" : "address";
+
+  // If the address is within the program's data section, it is impossible for it to be in the IO range.
+  // As said above, we can likely do work with hints/assumptions the compiler makes based upon this even
+  // if we do not know the exact value of the pointer. I have no idea how to actually do that, though.
+  if (address >= (unsigned)avr_arch->default_data_section_start)
+  {
+    debug_warn(x, "Volatile Access Simplified Case 0 (%u >= %u) - %s", address, (unsigned)avr_arch->default_data_section_start, name_str);
+    return false;
+  }
+
+  // TODO DC_MMK : implement address tests for different AVR versions.
+
+  if (strcmp(avr_arch->name, "avr6") == 0) // AVR6 : atmega256rfr2, atmega2560, atmega2561, atmega2564rfr2
+  {
+    // AVR6
+
+    // GPRs - 32 1-byte registers.
+    if (address < 0x20)
+    {
+      debug_warn(x, "Volatile Access Simplified Case 1 (%u < 0x20) - %s", address, name_str);
+      return false;
+    }
+
+    // See datasheet section 17.3 - Accessing 16-bit Registers
+
+    // 16-bit IO registers. Not all necessarily require these semantics.
+    static const unsigned int io_addresses[] = {
+      0x78,  // ADC L/H - Does ADC require these semantics?
+      0x84,  // TCNT1 L/H
+      0x86,  // ICR1 L/H
+      0x88,  // OCR1A L/H
+      0x8A,  // OCR1B L/H
+      0x8C,  // OCR1C L/H
+      0x94,  // TCNT3 L/H
+      0x96,  // ICR3 L/H
+      0x98,  // OCR3A L/H
+      0x9A,  // OCR3B L/H
+      0x9C,  // OCR3C L/H
+      0xA4,  // TCNT4 L/H
+      0xA6,  // ICR4 L/H
+      0xA8,  // OCR4A L/H
+      0xAA,  // OCR4B L/H
+      0xAC,  // OCR4C L/H
+      0x124, // TCNT5 L/H
+      0x126, // ICR5 L/H
+      0x128, // OCR5A L/H
+      0x12A, // OCR5B L/H
+      0x12C, // OCR5C L/H
+      /* Unsure about these */
+      0x21,  // EEAR L/H
+      0xC4,  // UBRR0 L/H
+      0xCC,  // UBRR1 L/H
+      0xD4,  // UBRR2 L/H
+      0x134, // UBRR3 L/H
+    };
+
+    // I don't believe GCC builds with C++11 or higher, so I don't think we have range-for.
+    static const unsigned io_address_cnt = sizeof(io_addresses) / sizeof(io_addresses[0]);
+    for (unsigned int i = 0; i < io_address_cnt; ++i)
+    {
+      const unsigned int test_address = io_addresses[i];
+
+      if (mask)
+      {
+        if ((address & test_address) != 0)
+        {
+          debug_warn(x, "Potential IO Register Access Detected (%u & %u != 0) - %s", address, test_address, name_str);
+          return true;
+        }
+      }
+      else
+      {
+        if (address == test_address)
+        {
+          debug_warn(x, "IO Register Access Detected (%u == %u) - %s", address, test_address, name_str);
+          return true;
+        }
+      }
+    }
+
+    debug_warn(x, "Volatile Access Simplified Case 2 (%u) - %s", address, name_str);
+    return false;
+  }
+
+  debug_warn(x, "Unknown AVR arch? (%u) - %s", address, name_str);
+  return true;
+}
+
+// Is rtx pointing to (or possibly pointing to) an IO register which requires special semantics on AVR?
+static bool is_io_register(rtx x)
+{
+  rtx orig_x = x;
+
+  // IO registers are always volatile. If it's not volatile, it cannot be an IO register.
+  if (MEM_VOLATILE_P(x) != 1)
+  {
+    return false;
+  }
+
+#if !EXPERIMENTAL_VOLATILE
+  return true;
+#else
+
+  // Unsure what exactly this does, but it's used in avr_address_tiny_absdata_p, which tries to resolve the address as well.
+  if (CONST == GET_CODE(x))
+  {
+    x = XEXP(XEXP(x, 0), 0);
+  }
+
+  // strip?
+  x = *strip_address_mutations(&x);
+  //x = convert_memory_address(GET_MODE(x), x);
+
+  // IO registers must be pointed to via SRAM or MEMX pointers. A FLASHn/PROGMEM pointer cannot point to IO registers.
+  if (MEM_ADDR_SPACE(x) != ADDR_SPACE_RAM && MEM_ADDR_SPACE(x) != ADDR_SPACE_MEMX)
+  {
+    debug_warn(orig_x, "16-bit access not in relevant address space, must not be IO register.");
+    return false;
+  }
+
+  // If the address is not constant, we cannot determine it's value presumably, and thus we must presume that it is potentially
+  // an IO register. We can probably do better than this by looking at the hints/assumptions GCC makes to see that, if the address is
+  // unknown, if it is potentially in the IO range. See the next test.
+  if (!CONSTANT_P(x) && !CONST_INT_P(x) && !CONST_WIDE_INT_P(x))
+  {
+    // If it's not constant, we can try using something like nonzero bits or num_sign_bit_copies1.
+    unsigned HOST_WIDE_INT nzbits = nonzero_bits(x, GET_MODE(x));
+    if ((nzbits & 0xFFF) == 0xFFF) // TODO
+    {
+      debug_warn(orig_x, "Could not determine if 16-bit Volatile Access was for IO register");
+      debug_warn(orig_x, "Dump 1:");
+      print_rtl(stderr, orig_x);
+      debug_warn(orig_x, "Dump 2:");
+      print_rtl(stderr, x);
+      return true;
+    }
+
+    bool is_io = validate_address_io<true>(orig_x, nzbits);
+    return is_io;
+  }
+
+  // Get the address from the rtx, and start comparing it against known values.
+  const unsigned int address = UINTVAL(x);
+
+  bool is_io = validate_address_io<false>(orig_x, address);
+  return is_io;
+#endif
+}
 
 class avr_pass_casesi : public rtl_opt_pass
 {
@@ -876,6 +1089,7 @@ avr_regno_reg_class (int r)
 
 
 /* Implement `TARGET_SCALAR_MODE_SUPPORTED_P'.  */
+// TODO DC_MMK
 
 static bool
 avr_scalar_mode_supported_p (scalar_mode mode)
@@ -1156,6 +1370,8 @@ avr_starting_frame_offset (void)
 
 /* Return the number of hard registers to push/pop in the prologue/epilogue
    of the current function, and optionally store these registers in SET.  */
+
+// TODO DC_MMK : Also don't save any registers that are not actually used, since GCC likes padding.
 
 static int
 avr_regs_to_save (HARD_REG_SET *set)
@@ -2783,6 +2999,10 @@ avr_print_operand_punct_valid_p (unsigned char code)
   return code == '~' || code == '!';
 }
 
+// Stolen from real.h
+
+#define REAL_VALUE_TO_TARGET_BITS(IN, OUT, BITS) \
+  ((OUT) = real_to_target (NULL, &(IN), float_mode_for_size (BITS).require ()))
 
 /* Implement `TARGET_PRINT_OPERAND'.  */
 /* Output X as assembler operand to file FILE.
@@ -2975,11 +3195,45 @@ avr_print_operand (FILE *file, rtx x, int code)
     }
   else if (CONST_DOUBLE_P (x))
     {
-      long val;
-      if (GET_MODE (x) != SFmode)
-        fatal_insn ("internal compiler error.  Unknown mode:", x);
-      REAL_VALUE_TO_TARGET_SINGLE (*CONST_DOUBLE_REAL_VALUE (x), val);
-      fprintf (file, "0x%lx", val);
+      long long val;
+      const machine_mode mode = GET_MODE(x);
+      unsigned int bits = GET_MODE_BITSIZE(mode);
+
+      // REAL_VALUE_TO_TARGET_BITS
+      if (mode == HFmode)
+      {
+        bits = 16;
+      }
+      else if (mode == PSFmode)
+      {
+        bits = 24;
+      }
+      else if (mode == SFmode)
+      {
+        bits = 32;
+      }
+
+      switch (bits)
+      {
+      case 16:
+        REAL_VALUE_TO_TARGET_BITS(*CONST_DOUBLE_REAL_VALUE(x), val, 16);
+        fprintf(file, "0x%lx", (long)val);
+        break;
+      case 24:
+        REAL_VALUE_TO_TARGET_BITS(*CONST_DOUBLE_REAL_VALUE(x), val, 24);
+        fprintf(file, "0x%lx", (long)val);
+        break;
+      case 32:
+        REAL_VALUE_TO_TARGET_BITS(*CONST_DOUBLE_REAL_VALUE(x), val, 32);
+        fprintf(file, "0x%lx", (long)val);
+        break;
+      case 64:
+        REAL_VALUE_TO_TARGET_BITS(*CONST_DOUBLE_REAL_VALUE(x), val, 64);
+        fprintf(file, "0x%llx", val);
+        break;
+      default:
+        fatal_insn("internal compiler error.  Unknown mode:", x);
+      }
     }
   else if (GET_CODE (x) == CONST_STRING)
     fputs (XSTR (x, 0), file);
@@ -3163,6 +3417,8 @@ avr_notice_update_cc (rtx body ATTRIBUTE_UNUSED, rtx_insn *insn)
    2 - relative jump in range -2046 <= x <= 2045 ;
    3 - absolute jump (only for ATmega[16]03).  */
 
+// TODO DC_MMK : Validate this isn't generating a jump to jump one instruction or such. Basically, make sure it's necessary.
+
 int
 avr_jump_mode (rtx x, rtx_insn *insn)
 {
@@ -3185,6 +3441,8 @@ avr_jump_mode (rtx x, rtx_insn *insn)
    X is a comparison RTX.
    LEN is a number returned by avr_jump_mode function.
    If REVERSE nonzero then condition code in X must be reversed.  */
+
+   // TODO DC_MMK : Validate this isn't generating a jump to jump one instruction or such. Basically, make sure it's necessary.
 
 const char*
 ret_cond_branch (rtx x, int len, int reverse)
@@ -3334,17 +3592,60 @@ avr_asm_final_postscan_insn (FILE *stream, rtx_insn *insn, rtx*, int)
 int
 avr_simplify_comparison_p (machine_mode mode, RTX_CODE op, rtx x)
 {
+#if EXPERIMENTAL_COMPARISON
+  // DImode
+
+  unsigned long long max = 0;
+
+  if (mode == BImode)
+  {
+    max = 0x1;
+  }
+  else if (mode == QImode)
+  {
+    max = 0xff;
+  }
+  else if (mode == HImode)
+  {
+    max = 0xffff;
+  }
+  else if (mode == PSImode)
+  {
+    max = 0xffffff;
+  }
+  else if (mode == SImode)
+  {
+    max = 0xffffffff;
+  }
+  else
+  {
+    unsigned int precision = GET_MODE_PRECISION(mode);
+    if (precision != 0)
+    {
+      if (precision == 64)
+      {
+        max = 0xffffffffffffffff;
+      }
+      else
+      {
+        max = (1ull << precision) - 1;
+      }
+    }
+  }
+#else
   unsigned int max = (mode == QImode ? 0xff :
                       mode == HImode ? 0xffff :
                       mode == PSImode ? 0xffffff :
                       mode == SImode ? 0xffffffff : 0);
+#endif
+
   if (max && op && CONST_INT_P (x))
     {
       if (unsigned_condition (op) != op)
         max >>= 1;
 
-      if (max != (INTVAL (x) & max)
-          && INTVAL (x) != 0xff)
+      if (max != (UINTVAL(x) & max)
+          && UINTVAL(x) != 0xff) // TODO DC_MMK : Why 0xff?
         return 1;
     }
   return 0;
@@ -3395,6 +3696,7 @@ avr_num_arg_regs (machine_mode mode, const_tree type)
   /* Align all function arguments to start in even-numbered registers.
      Odd-sized arguments leave holes above them.  */
 
+  // TODO DC_MMK : Find a way to not require this.
   return (size + 1) & ~1;
 }
 
@@ -4180,9 +4482,10 @@ avr_out_movhi_r_mr_pre_dec_tiny (rtx_insn *insn, rtx op[], int *plen)
   rtx src = op[1];
   rtx base = XEXP (src, 0);
 
+  // DC_MMK : TODO validate that this is actually needed or not.
   /* "volatile" forces reading low byte first, even if less efficient,
      for correct operation with 16-bit I/O registers.  */
-  mem_volatile_p = MEM_VOLATILE_P (src);
+  mem_volatile_p = is_io_register(src) ? 1 : 0;
 
   if (reg_overlap_mentioned_p (dest, XEXP (base, 0)))
     fatal_insn ("incorrect insn:", insn);
@@ -4206,9 +4509,10 @@ out_movhi_r_mr (rtx_insn *insn, rtx op[], int *plen)
   rtx base = XEXP (src, 0);
   int reg_dest = true_regnum (dest);
   int reg_base = true_regnum (base);
+  // DC_MMK : TODO validate that this is actually needed or not.
   /* "volatile" forces reading low byte first, even if less efficient,
      for correct operation with 16-bit I/O registers.  */
-  int mem_volatile_p = MEM_VOLATILE_P (src);
+  int mem_volatile_p = is_io_register(src) ? 1 : 0;
 
   if (reg_base > 0)
     {
@@ -4890,80 +5194,80 @@ out_movsi_mr_r (rtx_insn *insn, rtx op[], int *l)
 }
 
 const char *
-output_movsisf (rtx_insn *insn, rtx operands[], int *l)
+output_movsisf(rtx_insn *insn, rtx operands[], int *l)
 {
   int dummy;
   rtx dest = operands[0];
   rtx src = operands[1];
   int *real_l = l;
 
-  if (avr_mem_flash_p (src)
-      || avr_mem_flash_p (dest))
-    {
-      return avr_out_lpm (insn, operands, real_l);
-    }
+  if (avr_mem_flash_p(src)
+    || avr_mem_flash_p(dest))
+  {
+    return avr_out_lpm(insn, operands, real_l);
+  }
 
   if (!l)
     l = &dummy;
 
-  gcc_assert (GET_MODE_SIZE (GET_MODE (dest)) == 4);
+  gcc_assert(GET_MODE_SIZE(GET_MODE(dest)) == 4);
 
-  if (REG_P (dest))
+  if (REG_P(dest))
+  {
+    if (REG_P(src)) /* mov r,r */
     {
-      if (REG_P (src)) /* mov r,r */
-	{
-	  if (true_regnum (dest) > true_regnum (src))
-	    {
-	      if (AVR_HAVE_MOVW)
-		{
-		  *l = 2;
-		  return ("movw %C0,%C1" CR_TAB
-			  "movw %A0,%A1");
-		}
-	      *l = 4;
-	      return ("mov %D0,%D1" CR_TAB
-		      "mov %C0,%C1" CR_TAB
-		      "mov %B0,%B1" CR_TAB
-		      "mov %A0,%A1");
-	    }
-	  else
-	    {
-	      if (AVR_HAVE_MOVW)
-		{
-		  *l = 2;
-		  return ("movw %A0,%A1" CR_TAB
-			  "movw %C0,%C1");
-		}
-	      *l = 4;
-	      return ("mov %A0,%A1" CR_TAB
-		      "mov %B0,%B1" CR_TAB
-		      "mov %C0,%C1" CR_TAB
-		      "mov %D0,%D1");
-	    }
-	}
-      else if (CONSTANT_P (src))
-	{
-          return output_reload_insisf (operands, NULL_RTX, real_l);
+      if (true_regnum(dest) > true_regnum(src))
+      {
+        if (AVR_HAVE_MOVW)
+        {
+          *l = 2;
+          return ("movw %C0,%C1" CR_TAB
+            "movw %A0,%A1");
         }
-      else if (MEM_P (src))
-	return out_movsi_r_mr (insn, operands, real_l); /* mov r,m */
+        *l = 4;
+        return ("mov %D0,%D1" CR_TAB
+          "mov %C0,%C1" CR_TAB
+          "mov %B0,%B1" CR_TAB
+          "mov %A0,%A1");
+      }
+      else
+      {
+        if (AVR_HAVE_MOVW)
+        {
+          *l = 2;
+          return ("movw %A0,%A1" CR_TAB
+            "movw %C0,%C1");
+        }
+        *l = 4;
+        return ("mov %A0,%A1" CR_TAB
+          "mov %B0,%B1" CR_TAB
+          "mov %C0,%C1" CR_TAB
+          "mov %D0,%D1");
+      }
     }
-  else if (MEM_P (dest))
+    else if (CONSTANT_P(src))
     {
-      const char *templ;
-
-      if (src == CONST0_RTX (GET_MODE (dest)))
-        operands[1] = zero_reg_rtx;
-
-      templ = out_movsi_mr_r (insn, operands, real_l);
-
-      if (!real_l)
-	output_asm_insn (templ, operands);
-
-      operands[1] = src;
-      return "";
+      return output_reload_insisf(operands, NULL_RTX, real_l);
     }
-  fatal_insn ("invalid insn:", insn);
+    else if (MEM_P(src))
+      return out_movsi_r_mr(insn, operands, real_l); /* mov r,m */
+  }
+  else if (MEM_P(dest))
+  {
+    const char *templ;
+
+    if (src == CONST0_RTX(GET_MODE(dest)))
+      operands[1] = zero_reg_rtx;
+
+    templ = out_movsi_mr_r(insn, operands, real_l);
+
+    if (!real_l)
+      output_asm_insn(templ, operands);
+
+    operands[1] = src;
+    return "";
+  }
+  fatal_insn("invalid insn:", insn);
   return "";
 }
 
@@ -5414,6 +5718,12 @@ avr_out_movpsi (rtx_insn *insn, rtx *op, int *plen)
   return "";
 }
 
+const char *
+avr_out_movpsipsf(rtx_insn *insn, rtx *op, int *plen)
+{
+  return avr_out_movpsi(insn, op, plen);
+}
+
 static const char*
 avr_out_movqi_mr_r_reg_disp_tiny (rtx_insn *insn, rtx op[], int *plen)
 {
@@ -5519,9 +5829,10 @@ avr_out_movhi_mr_r_xmega (rtx_insn *insn, rtx op[], int *plen)
   int reg_base = true_regnum (base);
   int reg_src = true_regnum (src);
 
+  // DC_MMK : TODO validate
   /* "volatile" forces writing low byte first, even if less efficient,
      for correct operation with 16-bit I/O registers like SP.  */
-  int mem_volatile_p = MEM_VOLATILE_P (dest);
+  int mem_volatile_p = is_io_register(dest) ? 1 : 0;
 
   if (CONSTANT_ADDRESS_P (base))
     {
@@ -5628,7 +5939,8 @@ avr_out_movhi_mr_r_reg_no_disp_tiny (rtx_insn *insn, rtx op[], int *plen)
   rtx base = XEXP (dest, 0);
   int reg_base = true_regnum (base);
   int reg_src = true_regnum (src);
-  int mem_volatile_p = MEM_VOLATILE_P (dest);
+  // DC_MMK : TODO consider making a new modifier for IO ports so not all volatile variables are impeded.
+  int mem_volatile_p = is_io_register(dest) ? 1 : 0;
 
   if (reg_base == reg_src)
     {
@@ -5705,7 +6017,8 @@ out_movhi_mr_r (rtx_insn *insn, rtx op[], int *plen)
   if (AVR_XMEGA)
     return avr_out_movhi_mr_r_xmega (insn, op, plen);
 
-  mem_volatile_p = MEM_VOLATILE_P (dest);
+  // DC_MMK : TODO
+  mem_volatile_p = is_io_register(dest) ? 1 : 0;
 
   if (CONSTANT_ADDRESS_P (base))
     {
@@ -5893,6 +6206,8 @@ compare_eq_p (rtx_insn *insn)
    PLEN == NULL:  Output instructions.
    PLEN != NULL:  Set *PLEN to the length (in words) of the sequence.
                   Don't output anything.  */
+
+// TODO DC_MMK : We likely need to extend this for our newer type sizes.
 
 const char*
 avr_out_compare (rtx_insn *insn, rtx *xop, int *plen)
@@ -7713,6 +8028,8 @@ lshrsi3_out (rtx_insn *insn, rtx operands[], int *len)
    saturated addition / subtraction.  The only case where OUT_LABEL = false
    is useful is for saturated addition / subtraction performed during
    fixed-point rounding, cf. `avr_out_round'.  */
+
+// TODO DC_MMK : Extend for new types.
 
 static void
 avr_out_plus_1 (rtx *xop, int *plen, enum rtx_code code, int *pcc,
@@ -10703,16 +11020,16 @@ avr_memory_move_cost (machine_mode mode,
                       reg_class_t rclass ATTRIBUTE_UNUSED,
                       bool in ATTRIBUTE_UNUSED)
 {
-  return (mode == QImode ? 2
-          : mode == HImode ? 4
-          : mode == SImode ? 8
-          : mode == SFmode ? 8
-          : 16);
+  const unsigned int mode_size = GET_MODE_SIZE(mode);
+
+  return mode_size * 2;
 }
 
 
 /* Cost for mul highpart.  X is a LSHIFTRT, i.e. the outer TRUNCATE is
    already stripped off.  */
+
+// TODO DC_MMK : Fix for newer types?
 
 static int
 avr_mul_highpart_cost (rtx x, int)
@@ -10777,853 +11094,893 @@ avr_operand_rtx_cost (rtx x, machine_mode mode, enum rtx_code outer,
    In either case, *TOTAL contains the cost result.  */
 
 static bool
-avr_rtx_costs_1 (rtx x, machine_mode mode, int outer_code,
-                 int opno ATTRIBUTE_UNUSED, int *total, bool speed)
+avr_rtx_costs_1(rtx x, machine_mode mode, int outer_code,
+  int opno ATTRIBUTE_UNUSED, int *total, bool speed)
 {
-  enum rtx_code code = GET_CODE (x);
+  enum rtx_code code = GET_CODE(x);
   HOST_WIDE_INT val;
 
   switch (code)
+  {
+  case CONST_INT:
+  case CONST_FIXED:
+  case CONST_DOUBLE:
+  case SYMBOL_REF:
+  case CONST:
+  case LABEL_REF:
+    /* Immediate constants are as cheap as registers.  */
+    *total = 0;
+    return true;
+
+  case MEM:
+    *total = COSTS_N_INSNS(GET_MODE_SIZE(mode));
+    return true;
+
+  case NEG:
+    switch (mode)
     {
-    case CONST_INT:
-    case CONST_FIXED:
-    case CONST_DOUBLE:
-    case SYMBOL_REF:
-    case CONST:
-    case LABEL_REF:
-      /* Immediate constants are as cheap as registers.  */
-      *total = 0;
-      return true;
+    case E_QImode:
+    case E_SFmode:
+    case E_PSFmode:
+      *total = COSTS_N_INSNS(1);
+      break;
 
-    case MEM:
-      *total = COSTS_N_INSNS (GET_MODE_SIZE (mode));
-      return true;
+    case E_HImode:
+    case E_PSImode:
+    case E_SImode:
+      *total = COSTS_N_INSNS(2 * GET_MODE_SIZE(mode) - 1);
+      break;
 
-    case NEG:
-      switch (mode)
-	{
-	case E_QImode:
-	case E_SFmode:
-	  *total = COSTS_N_INSNS (1);
-	  break;
+    default: {
+      // DC_MMK : TODO validate this is correct.
+      if (SCALAR_FLOAT_MODE_P(mode) != 0)
+      {
+        *total = COSTS_N_INSNS(1);
+        break;
+      }
+      unsigned int mode_size = GET_MODE_SIZE(mode);
+      if (SCALAR_INT_MODE_P(mode) != 0)
+      {
+        if (mode_size == 1)
+        {
+          *total = COSTS_N_INSNS(1);
+        }
+        else
+        {
+          *total = COSTS_N_INSNS(2 * mode_size - 1);
+        }
+        break;
+      }
+      return false;
+    }
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
 
-        case E_HImode:
-        case E_PSImode:
-        case E_SImode:
-          *total = COSTS_N_INSNS (2 * GET_MODE_SIZE (mode) - 1);
-          break;
+  case ABS:
+    switch (mode)
+    {
+    case E_QImode:
+    case E_SFmode:
+    case E_PSFmode:
+      *total = COSTS_N_INSNS(1);
+      break;
 
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      return true;
+    default:
+      // DC_MMK : TODO validate this is correct.
+      if (SCALAR_FLOAT_MODE_P(mode) != 0)
+      {
+        *total = COSTS_N_INSNS(1);
+        break;
+      }
+      return false;
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
 
-    case ABS:
-      switch (mode)
-	{
-	case E_QImode:
-	case E_SFmode:
-	  *total = COSTS_N_INSNS (1);
-	  break;
+  case NOT:
+    *total = COSTS_N_INSNS(GET_MODE_SIZE(mode));
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
 
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      return true;
+  case ZERO_EXTEND:
+    *total = COSTS_N_INSNS(GET_MODE_SIZE(mode)
+      - GET_MODE_SIZE(GET_MODE(XEXP(x, 0))));
+    *total += avr_operand_rtx_cost(XEXP(x, 0), GET_MODE(XEXP(x, 0)),
+      code, 0, speed);
+    return true;
 
-    case NOT:
-      *total = COSTS_N_INSNS (GET_MODE_SIZE (mode));
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      return true;
+  case SIGN_EXTEND:
+    *total = COSTS_N_INSNS(GET_MODE_SIZE(mode) + 2
+      - GET_MODE_SIZE(GET_MODE(XEXP(x, 0))));
+    *total += avr_operand_rtx_cost(XEXP(x, 0), GET_MODE(XEXP(x, 0)),
+      code, 0, speed);
+    return true;
 
-    case ZERO_EXTEND:
-      *total = COSTS_N_INSNS (GET_MODE_SIZE (mode)
-			      - GET_MODE_SIZE (GET_MODE (XEXP (x, 0))));
-      *total += avr_operand_rtx_cost (XEXP (x, 0), GET_MODE (XEXP (x, 0)),
-				      code, 0, speed);
-      return true;
-
-    case SIGN_EXTEND:
-      *total = COSTS_N_INSNS (GET_MODE_SIZE (mode) + 2
-			      - GET_MODE_SIZE (GET_MODE (XEXP (x, 0))));
-      *total += avr_operand_rtx_cost (XEXP (x, 0), GET_MODE (XEXP (x, 0)),
-				      code, 0, speed);
-      return true;
-
-    case PLUS:
-      switch (mode)
-	{
-	case E_QImode:
-          if (AVR_HAVE_MUL
-              && MULT == GET_CODE (XEXP (x, 0))
-              && register_operand (XEXP (x, 1), QImode))
-            {
-              /* multiply-add */
-              *total = COSTS_N_INSNS (speed ? 4 : 3);
-              /* multiply-add with constant: will be split and load constant. */
-              if (CONST_INT_P (XEXP (XEXP (x, 0), 1)))
-                *total = COSTS_N_INSNS (1) + *total;
-              return true;
-            }
-	  *total = COSTS_N_INSNS (1);
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1, speed);
-	  break;
-
-	case E_HImode:
-          if (AVR_HAVE_MUL
-              && (MULT == GET_CODE (XEXP (x, 0))
-                  || ASHIFT == GET_CODE (XEXP (x, 0)))
-              && register_operand (XEXP (x, 1), HImode)
-              && (ZERO_EXTEND == GET_CODE (XEXP (XEXP (x, 0), 0))
-                  || SIGN_EXTEND == GET_CODE (XEXP (XEXP (x, 0), 0))))
-            {
-              /* multiply-add */
-              *total = COSTS_N_INSNS (speed ? 5 : 4);
-              /* multiply-add with constant: will be split and load constant. */
-              if (CONST_INT_P (XEXP (XEXP (x, 0), 1)))
-                *total = COSTS_N_INSNS (1) + *total;
-              return true;
-            }
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (2);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else if (IN_RANGE (INTVAL (XEXP (x, 1)), -63, 63))
-	    *total = COSTS_N_INSNS (1);
-	  else
-	    *total = COSTS_N_INSNS (2);
-	  break;
-
-        case E_PSImode:
-          if (!CONST_INT_P (XEXP (x, 1)))
-            {
-              *total = COSTS_N_INSNS (3);
-              *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-                                              speed);
-            }
-          else if (IN_RANGE (INTVAL (XEXP (x, 1)), -63, 63))
-            *total = COSTS_N_INSNS (2);
-          else
-            *total = COSTS_N_INSNS (3);
-          break;
-
-	case E_SImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (4);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else if (IN_RANGE (INTVAL (XEXP (x, 1)), -63, 63))
-	    *total = COSTS_N_INSNS (1);
-	  else
-	    *total = COSTS_N_INSNS (4);
-	  break;
-
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      return true;
-
-    case MINUS:
+    // TODO DC_MMK FIXME
+  case PLUS:
+    switch (mode)
+    {
+    case E_QImode:
       if (AVR_HAVE_MUL
-          && QImode == mode
-          && register_operand (XEXP (x, 0), QImode)
-          && MULT == GET_CODE (XEXP (x, 1)))
-        {
-          /* multiply-sub */
-          *total = COSTS_N_INSNS (speed ? 4 : 3);
-          /* multiply-sub with constant: will be split and load constant. */
-          if (CONST_INT_P (XEXP (XEXP (x, 1), 1)))
-            *total = COSTS_N_INSNS (1) + *total;
-          return true;
-        }
+        && MULT == GET_CODE(XEXP(x, 0))
+        && register_operand(XEXP(x, 1), QImode))
+      {
+        /* multiply-add */
+        *total = COSTS_N_INSNS(speed ? 4 : 3);
+        /* multiply-add with constant: will be split and load constant. */
+        if (CONST_INT_P(XEXP(XEXP(x, 0), 1)))
+          *total = COSTS_N_INSNS(1) + *total;
+        return true;
+      }
+      *total = COSTS_N_INSNS(1);
+      if (!CONST_INT_P(XEXP(x, 1)))
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1, speed);
+      break;
+
+    case E_HImode:
       if (AVR_HAVE_MUL
-          && HImode == mode
-          && register_operand (XEXP (x, 0), HImode)
-          && (MULT == GET_CODE (XEXP (x, 1))
-              || ASHIFT == GET_CODE (XEXP (x, 1)))
-          && (ZERO_EXTEND == GET_CODE (XEXP (XEXP (x, 1), 0))
-              || SIGN_EXTEND == GET_CODE (XEXP (XEXP (x, 1), 0))))
-        {
-          /* multiply-sub */
-          *total = COSTS_N_INSNS (speed ? 5 : 4);
-          /* multiply-sub with constant: will be split and load constant. */
-          if (CONST_INT_P (XEXP (XEXP (x, 1), 1)))
-            *total = COSTS_N_INSNS (1) + *total;
-          return true;
-        }
-      /* FALLTHRU */
-    case AND:
-    case IOR:
-      if (IOR == code
-          && HImode == mode
-          && ASHIFT == GET_CODE (XEXP (x, 0)))
-        {
-          *total = COSTS_N_INSNS (2);
-          // Just a rough estimate.  If we see no sign- or zero-extend,
-          // then increase the cost a little bit.
-          if (REG_P (XEXP (XEXP (x, 0), 0)))
-            *total += COSTS_N_INSNS (1);
-          if (REG_P (XEXP (x, 1)))
-            *total += COSTS_N_INSNS (1);
-          return true;
-        }
-      *total = COSTS_N_INSNS (GET_MODE_SIZE (mode));
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      if (!CONST_INT_P (XEXP (x, 1)))
-	*total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1, speed);
-      return true;
-
-    case XOR:
-      *total = COSTS_N_INSNS (GET_MODE_SIZE (mode));
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1, speed);
-      return true;
-
-    case MULT:
-      switch (mode)
-	{
-	case E_QImode:
-	  if (AVR_HAVE_MUL)
-	    *total = COSTS_N_INSNS (!speed ? 3 : 4);
-	  else if (!speed)
-	    *total = COSTS_N_INSNS (AVR_HAVE_JMP_CALL ? 2 : 1);
-	  else
-	    return false;
-	  break;
-
-	case E_HImode:
-	  if (AVR_HAVE_MUL)
-            {
-              rtx op0 = XEXP (x, 0);
-              rtx op1 = XEXP (x, 1);
-              enum rtx_code code0 = GET_CODE (op0);
-              enum rtx_code code1 = GET_CODE (op1);
-              bool ex0 = SIGN_EXTEND == code0 || ZERO_EXTEND == code0;
-              bool ex1 = SIGN_EXTEND == code1 || ZERO_EXTEND == code1;
-
-              if (ex0
-                  && (u8_operand (op1, HImode)
-                      || s8_operand (op1, HImode)))
-                {
-                  *total = COSTS_N_INSNS (!speed ? 4 : 6);
-                  return true;
-                }
-              if (ex0
-                  && register_operand (op1, HImode))
-                {
-                  *total = COSTS_N_INSNS (!speed ? 5 : 8);
-                  return true;
-                }
-              else if (ex0 || ex1)
-                {
-                  *total = COSTS_N_INSNS (!speed ? 3 : 5);
-                  return true;
-                }
-              else if (register_operand (op0, HImode)
-                       && (u8_operand (op1, HImode)
-                           || s8_operand (op1, HImode)))
-                {
-                  *total = COSTS_N_INSNS (!speed ? 6 : 9);
-                  return true;
-                }
-              else
-                *total = COSTS_N_INSNS (!speed ? 7 : 10);
-            }
-	  else if (!speed)
-	    *total = COSTS_N_INSNS (AVR_HAVE_JMP_CALL ? 2 : 1);
-	  else
-	    return false;
-	  break;
-
-        case E_PSImode:
-          if (!speed)
-            *total = COSTS_N_INSNS (AVR_HAVE_JMP_CALL ? 2 : 1);
-          else
-            *total = 10;
-          break;
-
-	case E_SImode:
-	case E_DImode:
-	  if (AVR_HAVE_MUL)
-            {
-              if (!speed)
-                {
-                  /* Add some additional costs besides CALL like moves etc.  */
-
-                  *total = COSTS_N_INSNS (AVR_HAVE_JMP_CALL ? 5 : 4);
-                }
-              else
-                {
-                  /* Just a rough estimate.  Even with -O2 we don't want bulky
-                     code expanded inline.  */
-
-                  *total = COSTS_N_INSNS (25);
-                }
-            }
-          else
-            {
-              if (speed)
-                *total = COSTS_N_INSNS (300);
-              else
-                /* Add some additional costs besides CALL like moves etc.  */
-                *total = COSTS_N_INSNS (AVR_HAVE_JMP_CALL ? 5 : 4);
-            }
-
-	  if (mode == DImode)
-	    *total *= 2;
-
-	  return true;
-
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1, speed);
-      return true;
-
-    case DIV:
-    case MOD:
-    case UDIV:
-    case UMOD:
-      if (!speed)
-        *total = COSTS_N_INSNS (AVR_HAVE_JMP_CALL ? 2 : 1);
+        && (MULT == GET_CODE(XEXP(x, 0))
+          || ASHIFT == GET_CODE(XEXP(x, 0)))
+        && register_operand(XEXP(x, 1), HImode)
+        && (ZERO_EXTEND == GET_CODE(XEXP(XEXP(x, 0), 0))
+          || SIGN_EXTEND == GET_CODE(XEXP(XEXP(x, 0), 0))))
+      {
+        /* multiply-add */
+        *total = COSTS_N_INSNS(speed ? 5 : 4);
+        /* multiply-add with constant: will be split and load constant. */
+        if (CONST_INT_P(XEXP(XEXP(x, 0), 1)))
+          *total = COSTS_N_INSNS(1) + *total;
+        return true;
+      }
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(2);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else if (IN_RANGE(INTVAL(XEXP(x, 1)), -63, 63))
+        *total = COSTS_N_INSNS(1);
       else
-        *total = COSTS_N_INSNS (15 * GET_MODE_SIZE (mode));
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      /* For div/mod with const-int divisor we have at least the cost of
-         loading the divisor. */
-      if (CONST_INT_P (XEXP (x, 1)))
-        *total += COSTS_N_INSNS (GET_MODE_SIZE (mode));
-      /* Add some overall penaly for clobbering and moving around registers */
-      *total += COSTS_N_INSNS (2);
+        *total = COSTS_N_INSNS(2);
+      break;
+
+    case E_PSImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(3);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else if (IN_RANGE(INTVAL(XEXP(x, 1)), -63, 63))
+        *total = COSTS_N_INSNS(2);
+      else
+        *total = COSTS_N_INSNS(3);
+      break;
+
+    case E_SImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(4);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else if (IN_RANGE(INTVAL(XEXP(x, 1)), -63, 63))
+        *total = COSTS_N_INSNS(1);
+      else
+        *total = COSTS_N_INSNS(4);
+      break;
+
+    default:
+      return false;
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
+
+    // TODO DC_MMK FIXME
+  case MINUS:
+    if (AVR_HAVE_MUL
+      && QImode == mode
+      && register_operand(XEXP(x, 0), QImode)
+      && MULT == GET_CODE(XEXP(x, 1)))
+    {
+      /* multiply-sub */
+      *total = COSTS_N_INSNS(speed ? 4 : 3);
+      /* multiply-sub with constant: will be split and load constant. */
+      if (CONST_INT_P(XEXP(XEXP(x, 1), 1)))
+        *total = COSTS_N_INSNS(1) + *total;
       return true;
-
-    case ROTATE:
-      switch (mode)
-	{
-	case E_QImode:
-	  if (CONST_INT_P (XEXP (x, 1)) && INTVAL (XEXP (x, 1)) == 4)
-	    *total = COSTS_N_INSNS (1);
-
-	  break;
-
-	case E_HImode:
-	  if (CONST_INT_P (XEXP (x, 1)) && INTVAL (XEXP (x, 1)) == 8)
-	    *total = COSTS_N_INSNS (3);
-
-	  break;
-
-	case E_SImode:
-	  if (CONST_INT_P (XEXP (x, 1)))
-	    switch (INTVAL (XEXP (x, 1)))
-	      {
-	      case 8:
-	      case 24:
-		*total = COSTS_N_INSNS (5);
-		break;
-	      case 16:
-		*total = COSTS_N_INSNS (AVR_HAVE_MOVW ? 4 : 6);
-		break;
-	      }
-	  break;
-
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
+    }
+    if (AVR_HAVE_MUL
+      && HImode == mode
+      && register_operand(XEXP(x, 0), HImode)
+      && (MULT == GET_CODE(XEXP(x, 1))
+        || ASHIFT == GET_CODE(XEXP(x, 1)))
+      && (ZERO_EXTEND == GET_CODE(XEXP(XEXP(x, 1), 0))
+        || SIGN_EXTEND == GET_CODE(XEXP(XEXP(x, 1), 0))))
+    {
+      /* multiply-sub */
+      *total = COSTS_N_INSNS(speed ? 5 : 4);
+      /* multiply-sub with constant: will be split and load constant. */
+      if (CONST_INT_P(XEXP(XEXP(x, 1), 1)))
+        *total = COSTS_N_INSNS(1) + *total;
       return true;
-
-    case ASHIFT:
-      switch (mode)
-	{
-	case E_QImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 4 : 17);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    {
-	      val = INTVAL (XEXP (x, 1));
-	      if (val == 7)
-		*total = COSTS_N_INSNS (3);
-	      else if (val >= 0 && val <= 7)
-		*total = COSTS_N_INSNS (val);
-	      else
-		*total = COSTS_N_INSNS (1);
-	    }
-	  break;
-
-	case E_HImode:
-          if (AVR_HAVE_MUL)
-            {
-              if (const_2_to_7_operand (XEXP (x, 1), HImode)
-                  && (SIGN_EXTEND == GET_CODE (XEXP (x, 0))
-                      || ZERO_EXTEND == GET_CODE (XEXP (x, 0))))
-                {
-                  *total = COSTS_N_INSNS (!speed ? 4 : 6);
-                  return true;
-                }
-            }
-
-          if (const1_rtx == (XEXP (x, 1))
-              && SIGN_EXTEND == GET_CODE (XEXP (x, 0)))
-            {
-              *total = COSTS_N_INSNS (2);
-              return true;
-            }
-
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 5 : 41);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    switch (INTVAL (XEXP (x, 1)))
-	      {
-	      case 0:
-		*total = 0;
-		break;
-	      case 1:
-	      case 8:
-		*total = COSTS_N_INSNS (2);
-		break;
-	      case 9:
-		*total = COSTS_N_INSNS (3);
-		break;
-	      case 2:
-	      case 3:
-	      case 10:
-	      case 15:
-		*total = COSTS_N_INSNS (4);
-		break;
-	      case 7:
-	      case 11:
-	      case 12:
-		*total = COSTS_N_INSNS (5);
-		break;
-	      case 4:
-		*total = COSTS_N_INSNS (!speed ? 5 : 8);
-		break;
-	      case 6:
-		*total = COSTS_N_INSNS (!speed ? 5 : 9);
-		break;
-	      case 5:
-		*total = COSTS_N_INSNS (!speed ? 5 : 10);
-		break;
-	      default:
-	        *total = COSTS_N_INSNS (!speed ? 5 : 41);
-	        *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-						speed);
-	      }
-	  break;
-
-        case E_PSImode:
-          if (!CONST_INT_P (XEXP (x, 1)))
-            {
-              *total = COSTS_N_INSNS (!speed ? 6 : 73);
-            }
-          else
-            switch (INTVAL (XEXP (x, 1)))
-              {
-              case 0:
-                *total = 0;
-                break;
-              case 1:
-              case 8:
-              case 16:
-                *total = COSTS_N_INSNS (3);
-                break;
-              case 23:
-                *total = COSTS_N_INSNS (5);
-                break;
-              default:
-                *total = COSTS_N_INSNS (!speed ? 5 : 3 * INTVAL (XEXP (x, 1)));
-                break;
-              }
-          break;
-
-	case E_SImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 7 : 113);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    switch (INTVAL (XEXP (x, 1)))
-	      {
-	      case 0:
-		*total = 0;
-		break;
-	      case 24:
-		*total = COSTS_N_INSNS (3);
-		break;
-	      case 1:
-	      case 8:
-	      case 16:
-		*total = COSTS_N_INSNS (4);
-		break;
-	      case 31:
-		*total = COSTS_N_INSNS (6);
-		break;
-	      case 2:
-		*total = COSTS_N_INSNS (!speed ? 7 : 8);
-		break;
-	      default:
-		*total = COSTS_N_INSNS (!speed ? 7 : 113);
-		*total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-						speed);
-	      }
-	  break;
-
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
+    }
+    /* FALLTHRU */
+    // TODO DC_MMK FIXME
+  case AND:
+  case IOR:
+    if (IOR == code
+      && HImode == mode
+      && ASHIFT == GET_CODE(XEXP(x, 0)))
+    {
+      *total = COSTS_N_INSNS(2);
+      // Just a rough estimate.  If we see no sign- or zero-extend,
+      // then increase the cost a little bit.
+      if (REG_P(XEXP(XEXP(x, 0), 0)))
+        *total += COSTS_N_INSNS(1);
+      if (REG_P(XEXP(x, 1)))
+        *total += COSTS_N_INSNS(1);
       return true;
+    }
+    *total = COSTS_N_INSNS(GET_MODE_SIZE(mode));
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    if (!CONST_INT_P(XEXP(x, 1)))
+      *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1, speed);
+    return true;
 
-    case ASHIFTRT:
-      switch (mode)
-	{
-	case E_QImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 4 : 17);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    {
-	      val = INTVAL (XEXP (x, 1));
-	      if (val == 6)
-		*total = COSTS_N_INSNS (4);
-	      else if (val == 7)
-		*total = COSTS_N_INSNS (2);
-	      else if (val >= 0 && val <= 7)
-		*total = COSTS_N_INSNS (val);
-	      else
-		*total = COSTS_N_INSNS (1);
-	    }
-	  break;
+  case XOR:
+    *total = COSTS_N_INSNS(GET_MODE_SIZE(mode));
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1, speed);
+    return true;
 
-	case E_HImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 5 : 41);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    switch (INTVAL (XEXP (x, 1)))
-	      {
-	      case 0:
-		*total = 0;
-		break;
-	      case 1:
-		*total = COSTS_N_INSNS (2);
-		break;
-	      case 15:
-		*total = COSTS_N_INSNS (3);
-		break;
-	      case 2:
-	      case 7:
-              case 8:
-              case 9:
-		*total = COSTS_N_INSNS (4);
-		break;
-              case 10:
-	      case 14:
-		*total = COSTS_N_INSNS (5);
-		break;
-              case 11:
-                *total = COSTS_N_INSNS (!speed ? 5 : 6);
-		break;
-              case 12:
-                *total = COSTS_N_INSNS (!speed ? 5 : 7);
-		break;
-              case 6:
-	      case 13:
-                *total = COSTS_N_INSNS (!speed ? 5 : 8);
-		break;
-	      default:
-	        *total = COSTS_N_INSNS (!speed ? 5 : 41);
-	        *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-						speed);
-	      }
-	  break;
+    // TODO DC_MMK FIXME
+  case MULT:
+    switch (mode)
+    {
+    case E_QImode:
+      if (AVR_HAVE_MUL)
+        *total = COSTS_N_INSNS(!speed ? 3 : 4);
+      else if (!speed)
+        *total = COSTS_N_INSNS(AVR_HAVE_JMP_CALL ? 2 : 1);
+      else
+        return false;
+      break;
 
-        case E_PSImode:
-          if (!CONST_INT_P (XEXP (x, 1)))
-            {
-              *total = COSTS_N_INSNS (!speed ? 6 : 73);
-            }
-          else
-            switch (INTVAL (XEXP (x, 1)))
-              {
-              case 0:
-                *total = 0;
-                break;
-              case 1:
-                *total = COSTS_N_INSNS (3);
-                break;
-              case 16:
-              case 8:
-                *total = COSTS_N_INSNS (5);
-                break;
-              case 23:
-                *total = COSTS_N_INSNS (4);
-                break;
-              default:
-                *total = COSTS_N_INSNS (!speed ? 5 : 3 * INTVAL (XEXP (x, 1)));
-                break;
-              }
-          break;
+    case E_HImode:
+      if (AVR_HAVE_MUL)
+      {
+        rtx op0 = XEXP(x, 0);
+        rtx op1 = XEXP(x, 1);
+        enum rtx_code code0 = GET_CODE(op0);
+        enum rtx_code code1 = GET_CODE(op1);
+        bool ex0 = SIGN_EXTEND == code0 || ZERO_EXTEND == code0;
+        bool ex1 = SIGN_EXTEND == code1 || ZERO_EXTEND == code1;
 
-	case E_SImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 7 : 113);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    switch (INTVAL (XEXP (x, 1)))
-	      {
-	      case 0:
-		*total = 0;
-		break;
-	      case 1:
-		*total = COSTS_N_INSNS (4);
-		break;
-	      case 8:
-	      case 16:
-	      case 24:
-		*total = COSTS_N_INSNS (6);
-		break;
-	      case 2:
-		*total = COSTS_N_INSNS (!speed ? 7 : 8);
-		break;
-	      case 31:
-		*total = COSTS_N_INSNS (AVR_HAVE_MOVW ? 4 : 5);
-		break;
-	      default:
-		*total = COSTS_N_INSNS (!speed ? 7 : 113);
-		*total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-						speed);
-	      }
-	  break;
-
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      return true;
-
-    case LSHIFTRT:
-      if (outer_code == TRUNCATE)
+        if (ex0
+          && (u8_operand(op1, HImode)
+            || s8_operand(op1, HImode)))
         {
-          *total = avr_mul_highpart_cost (x, speed);
+          *total = COSTS_N_INSNS(!speed ? 4 : 6);
           return true;
         }
-
-      switch (mode)
-	{
-	case E_QImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 4 : 17);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    {
-	      val = INTVAL (XEXP (x, 1));
-	      if (val == 7)
-		*total = COSTS_N_INSNS (3);
-	      else if (val >= 0 && val <= 7)
-		*total = COSTS_N_INSNS (val);
-	      else
-		*total = COSTS_N_INSNS (1);
-	    }
-	  break;
-
-	case E_HImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 5 : 41);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    switch (INTVAL (XEXP (x, 1)))
-	      {
-	      case 0:
-		*total = 0;
-		break;
-	      case 1:
-	      case 8:
-		*total = COSTS_N_INSNS (2);
-		break;
-	      case 9:
-		*total = COSTS_N_INSNS (3);
-		break;
-	      case 2:
-	      case 10:
-	      case 15:
-		*total = COSTS_N_INSNS (4);
-		break;
-	      case 7:
-              case 11:
-		*total = COSTS_N_INSNS (5);
-		break;
-	      case 3:
-	      case 12:
-	      case 13:
-	      case 14:
-		*total = COSTS_N_INSNS (!speed ? 5 : 6);
-		break;
-	      case 4:
-		*total = COSTS_N_INSNS (!speed ? 5 : 7);
-		break;
-	      case 5:
-	      case 6:
-		*total = COSTS_N_INSNS (!speed ? 5 : 9);
-		break;
-	      default:
-	        *total = COSTS_N_INSNS (!speed ? 5 : 41);
-	        *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-						speed);
-	      }
-	  break;
-
-        case E_PSImode:
-          if (!CONST_INT_P (XEXP (x, 1)))
-            {
-              *total = COSTS_N_INSNS (!speed ? 6 : 73);
-            }
-          else
-            switch (INTVAL (XEXP (x, 1)))
-              {
-              case 0:
-                *total = 0;
-                break;
-              case 1:
-              case 8:
-              case 16:
-                *total = COSTS_N_INSNS (3);
-                break;
-              case 23:
-                *total = COSTS_N_INSNS (5);
-                break;
-              default:
-                *total = COSTS_N_INSNS (!speed ? 5 : 3 * INTVAL (XEXP (x, 1)));
-                break;
-              }
-          break;
-
-	case E_SImode:
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    {
-	      *total = COSTS_N_INSNS (!speed ? 7 : 113);
-	      *total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-					      speed);
-	    }
-	  else
-	    switch (INTVAL (XEXP (x, 1)))
-	      {
-	      case 0:
-		*total = 0;
-		break;
-	      case 1:
-		*total = COSTS_N_INSNS (4);
-		break;
-	      case 2:
-		*total = COSTS_N_INSNS (!speed ? 7 : 8);
-		break;
-	      case 8:
-	      case 16:
-	      case 24:
-		*total = COSTS_N_INSNS (4);
-		break;
-	      case 31:
-		*total = COSTS_N_INSNS (6);
-		break;
-	      default:
-		*total = COSTS_N_INSNS (!speed ? 7 : 113);
-		*total += avr_operand_rtx_cost (XEXP (x, 1), mode, code, 1,
-						speed);
-	      }
-	  break;
-
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), mode, code, 0, speed);
-      return true;
-
-    case COMPARE:
-      switch (GET_MODE (XEXP (x, 0)))
-	{
-	case E_QImode:
-	  *total = COSTS_N_INSNS (1);
-	  if (!CONST_INT_P (XEXP (x, 1)))
-	    *total += avr_operand_rtx_cost (XEXP (x, 1), QImode, code,
-					    1, speed);
-	  break;
-
-        case E_HImode:
-	  *total = COSTS_N_INSNS (2);
-	  if (!CONST_INT_P (XEXP (x, 1)))
-            *total += avr_operand_rtx_cost (XEXP (x, 1), HImode, code,
-					    1, speed);
-	  else if (INTVAL (XEXP (x, 1)) != 0)
-	    *total += COSTS_N_INSNS (1);
-          break;
-
-        case E_PSImode:
-          *total = COSTS_N_INSNS (3);
-          if (CONST_INT_P (XEXP (x, 1)) && INTVAL (XEXP (x, 1)) != 0)
-            *total += COSTS_N_INSNS (2);
-          break;
-
-        case E_SImode:
-          *total = COSTS_N_INSNS (4);
-          if (!CONST_INT_P (XEXP (x, 1)))
-            *total += avr_operand_rtx_cost (XEXP (x, 1), SImode, code,
-					    1, speed);
-	  else if (INTVAL (XEXP (x, 1)) != 0)
-	    *total += COSTS_N_INSNS (3);
-          break;
-
-	default:
-	  return false;
-	}
-      *total += avr_operand_rtx_cost (XEXP (x, 0), GET_MODE (XEXP (x, 0)),
-				      code, 0, speed);
-      return true;
-
-    case TRUNCATE:
-      if (LSHIFTRT == GET_CODE (XEXP (x, 0)))
+        if (ex0
+          && register_operand(op1, HImode))
         {
-          *total = avr_mul_highpart_cost (XEXP (x, 0), speed);
+          *total = COSTS_N_INSNS(!speed ? 5 : 8);
           return true;
+        }
+        else if (ex0 || ex1)
+        {
+          *total = COSTS_N_INSNS(!speed ? 3 : 5);
+          return true;
+        }
+        else if (register_operand(op0, HImode)
+          && (u8_operand(op1, HImode)
+            || s8_operand(op1, HImode)))
+        {
+          *total = COSTS_N_INSNS(!speed ? 6 : 9);
+          return true;
+        }
+        else
+          *total = COSTS_N_INSNS(!speed ? 7 : 10);
+      }
+      else if (!speed)
+        *total = COSTS_N_INSNS(AVR_HAVE_JMP_CALL ? 2 : 1);
+      else
+        return false;
+      break;
+
+    case E_PSImode:
+      if (!speed)
+        *total = COSTS_N_INSNS(AVR_HAVE_JMP_CALL ? 2 : 1);
+      else
+        *total = 10;
+      break;
+
+    case E_SImode:
+    case E_DImode:
+      if (AVR_HAVE_MUL)
+      {
+        if (!speed)
+        {
+          /* Add some additional costs besides CALL like moves etc.  */
+
+          *total = COSTS_N_INSNS(AVR_HAVE_JMP_CALL ? 5 : 4);
+        }
+        else
+        {
+          /* Just a rough estimate.  Even with -O2 we don't want bulky
+             code expanded inline.  */
+
+          *total = COSTS_N_INSNS(25);
+        }
+      }
+      else
+      {
+        if (speed)
+          *total = COSTS_N_INSNS(300);
+        else
+          /* Add some additional costs besides CALL like moves etc.  */
+          *total = COSTS_N_INSNS(AVR_HAVE_JMP_CALL ? 5 : 4);
+      }
+
+      if (mode == DImode)
+        *total *= 2;
+
+      return true;
+
+    default:
+      return false;
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1, speed);
+    return true;
+
+  case DIV:
+  case MOD:
+  case UDIV:
+  case UMOD:
+    if (!speed)
+      *total = COSTS_N_INSNS(AVR_HAVE_JMP_CALL ? 2 : 1);
+    else
+      *total = COSTS_N_INSNS(15 * GET_MODE_SIZE(mode));
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    /* For div/mod with const-int divisor we have at least the cost of
+       loading the divisor. */
+    if (CONST_INT_P(XEXP(x, 1)))
+      *total += COSTS_N_INSNS(GET_MODE_SIZE(mode));
+    /* Add some overall penaly for clobbering and moving around registers */
+    *total += COSTS_N_INSNS(2);
+    return true;
+
+    // TODO DC_MMK FIXME
+  case ROTATE:
+    switch (mode)
+    {
+    case E_QImode:
+      if (CONST_INT_P(XEXP(x, 1)) && INTVAL(XEXP(x, 1)) == 4)
+        *total = COSTS_N_INSNS(1);
+      break;
+
+    case E_HImode:
+      if (CONST_INT_P(XEXP(x, 1)) && INTVAL(XEXP(x, 1)) == 8)
+        *total = COSTS_N_INSNS(3);
+      break;
+
+    // DC_MMK : TODO validate that this is correct
+    case E_PSImode:
+      if (CONST_INT_P(XEXP(x, 1)) && INTVAL(XEXP(x, 1)) == 12)
+        *total = COSTS_N_INSNS(4); // 5?
+      break;
+
+    case E_SImode:
+      if (CONST_INT_P(XEXP(x, 1)))
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 8:
+        case 24:
+          *total = COSTS_N_INSNS(5);
+          break;
+        case 16:
+          *total = COSTS_N_INSNS(AVR_HAVE_MOVW ? 4 : 6);
+          break;
         }
       break;
 
     default:
-      break;
+      return false;
     }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
+
+    // TODO DC_MMK FIXME
+  case ASHIFT:
+    switch (mode)
+    {
+    case E_QImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 4 : 17);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+      {
+        val = INTVAL(XEXP(x, 1));
+        if (val == 7)
+          *total = COSTS_N_INSNS(3);
+        else if (val >= 0 && val <= 7)
+          *total = COSTS_N_INSNS(val);
+        else
+          *total = COSTS_N_INSNS(1);
+      }
+      break;
+
+    case E_HImode:
+      if (AVR_HAVE_MUL)
+      {
+        if (const_2_to_7_operand(XEXP(x, 1), HImode)
+          && (SIGN_EXTEND == GET_CODE(XEXP(x, 0))
+            || ZERO_EXTEND == GET_CODE(XEXP(x, 0))))
+        {
+          *total = COSTS_N_INSNS(!speed ? 4 : 6);
+          return true;
+        }
+      }
+
+      if (const1_rtx == (XEXP(x, 1))
+        && SIGN_EXTEND == GET_CODE(XEXP(x, 0)))
+      {
+        *total = COSTS_N_INSNS(2);
+        return true;
+      }
+
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 5 : 41);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+        case 8:
+          *total = COSTS_N_INSNS(2);
+          break;
+        case 9:
+          *total = COSTS_N_INSNS(3);
+          break;
+        case 2:
+        case 3:
+        case 10:
+        case 15:
+          *total = COSTS_N_INSNS(4);
+          break;
+        case 7:
+        case 11:
+        case 12:
+          *total = COSTS_N_INSNS(5);
+          break;
+        case 4:
+          *total = COSTS_N_INSNS(!speed ? 5 : 8);
+          break;
+        case 6:
+          *total = COSTS_N_INSNS(!speed ? 5 : 9);
+          break;
+        case 5:
+          *total = COSTS_N_INSNS(!speed ? 5 : 10);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 5 : 41);
+          *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+            speed);
+        }
+      break;
+
+    case E_PSImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 6 : 73);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+        case 8:
+        case 16:
+          *total = COSTS_N_INSNS(3);
+          break;
+        case 23:
+          *total = COSTS_N_INSNS(5);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 5 : 3 * INTVAL(XEXP(x, 1)));
+          break;
+        }
+      break;
+
+    case E_SImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 7 : 113);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 24:
+          *total = COSTS_N_INSNS(3);
+          break;
+        case 1:
+        case 8:
+        case 16:
+          *total = COSTS_N_INSNS(4);
+          break;
+        case 31:
+          *total = COSTS_N_INSNS(6);
+          break;
+        case 2:
+          *total = COSTS_N_INSNS(!speed ? 7 : 8);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 7 : 113);
+          *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+            speed);
+        }
+      break;
+
+    default:
+      return false;
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
+
+    // TODO DC_MMK FIXME
+  case ASHIFTRT:
+    switch (mode)
+    {
+    case E_QImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 4 : 17);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+      {
+        val = INTVAL(XEXP(x, 1));
+        if (val == 6)
+          *total = COSTS_N_INSNS(4);
+        else if (val == 7)
+          *total = COSTS_N_INSNS(2);
+        else if (val >= 0 && val <= 7)
+          *total = COSTS_N_INSNS(val);
+        else
+          *total = COSTS_N_INSNS(1);
+      }
+      break;
+
+    case E_HImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 5 : 41);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+          *total = COSTS_N_INSNS(2);
+          break;
+        case 15:
+          *total = COSTS_N_INSNS(3);
+          break;
+        case 2:
+        case 7:
+        case 8:
+        case 9:
+          *total = COSTS_N_INSNS(4);
+          break;
+        case 10:
+        case 14:
+          *total = COSTS_N_INSNS(5);
+          break;
+        case 11:
+          *total = COSTS_N_INSNS(!speed ? 5 : 6);
+          break;
+        case 12:
+          *total = COSTS_N_INSNS(!speed ? 5 : 7);
+          break;
+        case 6:
+        case 13:
+          *total = COSTS_N_INSNS(!speed ? 5 : 8);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 5 : 41);
+          *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+            speed);
+        }
+      break;
+
+    case E_PSImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 6 : 73);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+          *total = COSTS_N_INSNS(3);
+          break;
+        case 16:
+        case 8:
+          *total = COSTS_N_INSNS(5);
+          break;
+        case 23:
+          *total = COSTS_N_INSNS(4);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 5 : 3 * INTVAL(XEXP(x, 1)));
+          break;
+        }
+      break;
+
+    case E_SImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 7 : 113);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+          *total = COSTS_N_INSNS(4);
+          break;
+        case 8:
+        case 16:
+        case 24:
+          *total = COSTS_N_INSNS(6);
+          break;
+        case 2:
+          *total = COSTS_N_INSNS(!speed ? 7 : 8);
+          break;
+        case 31:
+          *total = COSTS_N_INSNS(AVR_HAVE_MOVW ? 4 : 5);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 7 : 113);
+          *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+            speed);
+        }
+      break;
+
+    default:
+      return false;
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
+
+    // TODO DC_MMK FIXME
+  case LSHIFTRT:
+    if (outer_code == TRUNCATE)
+    {
+      *total = avr_mul_highpart_cost(x, speed);
+      return true;
+    }
+
+    switch (mode)
+    {
+    case E_QImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 4 : 17);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+      {
+        val = INTVAL(XEXP(x, 1));
+        if (val == 7)
+          *total = COSTS_N_INSNS(3);
+        else if (val >= 0 && val <= 7)
+          *total = COSTS_N_INSNS(val);
+        else
+          *total = COSTS_N_INSNS(1);
+      }
+      break;
+
+    case E_HImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 5 : 41);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+        case 8:
+          *total = COSTS_N_INSNS(2);
+          break;
+        case 9:
+          *total = COSTS_N_INSNS(3);
+          break;
+        case 2:
+        case 10:
+        case 15:
+          *total = COSTS_N_INSNS(4);
+          break;
+        case 7:
+        case 11:
+          *total = COSTS_N_INSNS(5);
+          break;
+        case 3:
+        case 12:
+        case 13:
+        case 14:
+          *total = COSTS_N_INSNS(!speed ? 5 : 6);
+          break;
+        case 4:
+          *total = COSTS_N_INSNS(!speed ? 5 : 7);
+          break;
+        case 5:
+        case 6:
+          *total = COSTS_N_INSNS(!speed ? 5 : 9);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 5 : 41);
+          *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+            speed);
+        }
+      break;
+
+    case E_PSImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 6 : 73);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+        case 8:
+        case 16:
+          *total = COSTS_N_INSNS(3);
+          break;
+        case 23:
+          *total = COSTS_N_INSNS(5);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 5 : 3 * INTVAL(XEXP(x, 1)));
+          break;
+        }
+      break;
+
+    case E_SImode:
+      if (!CONST_INT_P(XEXP(x, 1)))
+      {
+        *total = COSTS_N_INSNS(!speed ? 7 : 113);
+        *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+          speed);
+      }
+      else
+        switch (INTVAL(XEXP(x, 1)))
+        {
+        case 0:
+          *total = 0;
+          break;
+        case 1:
+          *total = COSTS_N_INSNS(4);
+          break;
+        case 2:
+          *total = COSTS_N_INSNS(!speed ? 7 : 8);
+          break;
+        case 8:
+        case 16:
+        case 24:
+          *total = COSTS_N_INSNS(4);
+          break;
+        case 31:
+          *total = COSTS_N_INSNS(6);
+          break;
+        default:
+          *total = COSTS_N_INSNS(!speed ? 7 : 113);
+          *total += avr_operand_rtx_cost(XEXP(x, 1), mode, code, 1,
+            speed);
+        }
+      break;
+
+    default:
+      return false;
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), mode, code, 0, speed);
+    return true;
+
+  case COMPARE:
+    switch (GET_MODE(XEXP(x, 0)))
+    {
+    case E_QImode:
+      *total = COSTS_N_INSNS(1);
+      if (!CONST_INT_P(XEXP(x, 1)))
+        *total += avr_operand_rtx_cost(XEXP(x, 1), QImode, code,
+          1, speed);
+      break;
+
+    case E_HImode:
+      *total = COSTS_N_INSNS(2);
+      if (!CONST_INT_P(XEXP(x, 1)))
+        *total += avr_operand_rtx_cost(XEXP(x, 1), HImode, code,
+          1, speed);
+      else if (INTVAL(XEXP(x, 1)) != 0)
+        *total += COSTS_N_INSNS(1);
+      break;
+
+    case E_PSImode:
+      *total = COSTS_N_INSNS(3);
+      if (CONST_INT_P(XEXP(x, 1)) && INTVAL(XEXP(x, 1)) != 0)
+        *total += COSTS_N_INSNS(2);
+      break;
+
+    case E_SImode:
+      *total = COSTS_N_INSNS(4);
+      if (!CONST_INT_P(XEXP(x, 1)))
+        *total += avr_operand_rtx_cost(XEXP(x, 1), SImode, code,
+          1, speed);
+      else if (INTVAL(XEXP(x, 1)) != 0)
+        *total += COSTS_N_INSNS(3);
+      break;
+
+    default:
+      return false;
+    }
+    *total += avr_operand_rtx_cost(XEXP(x, 0), GET_MODE(XEXP(x, 0)),
+      code, 0, speed);
+    return true;
+
+  case TRUNCATE:
+    if (LSHIFTRT == GET_CODE(XEXP(x, 0)))
+    {
+      *total = avr_mul_highpart_cost(XEXP(x, 0), speed);
+      return true;
+    }
+    break;
+
+  default:
+    break;
+  }
   return false;
 }
 
@@ -13989,13 +14346,36 @@ avr_builtin_decl (unsigned id, bool initialize_p ATTRIBUTE_UNUSED)
 
 
 static void
-avr_init_builtin_int24 (void)
+avr_init_builtin_intx (void)
 {
-  tree int24_type  = make_signed_type (GET_MODE_BITSIZE (PSImode));
-  tree uint24_type = make_unsigned_type (GET_MODE_BITSIZE (PSImode));
+  static const unsigned float_bits[] = {
+    16, 24, 32, 64
+  };
 
-  lang_hooks.types.register_builtin_type (int24_type, "__int24");
-  lang_hooks.types.register_builtin_type (uint24_type, "__uint24");
+  for (unsigned bits : float_bits)
+  {
+    char buffer[11];
+    sprintf(buffer, "__float%u", bits);
+
+    tree float_type = make_node(REAL_TYPE);
+    TYPE_PRECISION(float_type) = bits;
+    layout_type(float_type);
+
+    lang_hooks.types.register_builtin_type(float_type, buffer);
+  }
+
+  static const unsigned int_bits[] = {
+    1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64
+  };
+
+  for (unsigned bits : int_bits)
+  {
+    char buffer[10];
+    sprintf(buffer, "__int%u", bits);
+    lang_hooks.types.register_builtin_type(make_signed_type(bits), buffer);
+    sprintf(buffer, "__uint%u", bits);
+    lang_hooks.types.register_builtin_type(make_unsigned_type(bits), buffer);
+  }
 }
 
 
@@ -14177,7 +14557,7 @@ avr_init_builtins (void)
 #include "builtins.def"
 #undef DEF_BUILTIN
 
-  avr_init_builtin_int24 ();
+  avr_init_builtin_intx ();
 }
 
 

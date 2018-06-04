@@ -2511,156 +2511,161 @@ write_CV_qualifiers_for_type (const tree type)
 		    ::= u <source-name>  # vendor extended type */
 
 static void
-write_builtin_type (tree type)
+write_builtin_type(tree type)
 {
-  if (TYPE_CANONICAL (type))
-    type = TYPE_CANONICAL (type);
+  if (TYPE_CANONICAL(type))
+    type = TYPE_CANONICAL(type);
 
-  switch (TREE_CODE (type))
+  switch (TREE_CODE(type))
+  {
+  case VOID_TYPE:
+    write_char('v');
+    break;
+
+  case BOOLEAN_TYPE:
+    write_char('b');
+    break;
+
+  case INTEGER_TYPE:
+    /* TYPE may still be wchar_t, char16_t, or char32_t, since that
+ isn't in integer_type_nodes.  */
+    if (type == wchar_type_node)
+      write_char('w');
+    else if (type == char16_type_node)
+      write_string("Ds");
+    else if (type == char32_type_node)
+      write_string("Di");
+    else
     {
-    case VOID_TYPE:
-      write_char ('v');
-      break;
+      size_t itk;
+      /* Assume TYPE is one of the shared integer type nodes.  Find
+         it in the array of these nodes.  */
+    iagain:
+      for (itk = 0; itk < itk_none; ++itk)
+        if (integer_types[itk] != NULL_TREE
+          && integer_type_codes[itk] != '\0'
+          && type == integer_types[itk])
+        {
+          /* Print the corresponding single-letter code.  */
+          write_char(integer_type_codes[itk]);
+          break;
+        }
 
-    case BOOLEAN_TYPE:
-      write_char ('b');
-      break;
+      if (itk == itk_none)
+      {
+        tree t = c_common_type_for_mode(TYPE_MODE(type),
+          TYPE_UNSIGNED(type));
+        if (type != t)
+        {
+          type = t;
+          goto iagain;
+        }
 
-    case INTEGER_TYPE:
-      /* TYPE may still be wchar_t, char16_t, or char32_t, since that
-	 isn't in integer_type_nodes.  */
-      if (type == wchar_type_node)
-	write_char ('w');
-      else if (type == char16_type_node)
-	write_string ("Ds");
-      else if (type == char32_type_node)
-	write_string ("Di");
-      else
-	{
-	  size_t itk;
-	  /* Assume TYPE is one of the shared integer type nodes.  Find
-	     it in the array of these nodes.  */
-	iagain:
-	  for (itk = 0; itk < itk_none; ++itk)
-	    if (integer_types[itk] != NULL_TREE
-		&& integer_type_codes[itk] != '\0'
-		&& type == integer_types[itk])
-	      {
-		/* Print the corresponding single-letter code.  */
-		write_char (integer_type_codes[itk]);
-		break;
-	      }
+        if (TYPE_PRECISION(type) == 128)
+          write_char(TYPE_UNSIGNED(type) ? 'o' : 'n');
+        else
+        {
+          /* Allow for cases where TYPE is not one of the shared
+             integer type nodes and write a "vendor extended builtin
+             type" with a name the form intN or uintN, respectively.
+             Situations like this can happen if you have an
+             __attribute__((__mode__(__SI__))) type and use exotic
+             switches like '-mint8' on AVR.  Of course, this is
+             undefined by the C++ ABI (and '-mint8' is not even
+             Standard C conforming), but when using such special
+             options you're pretty much in nowhere land anyway.  */
+          const char *prefix;
+          char prec[11];	/* up to ten digits for an unsigned */
 
-	  if (itk == itk_none)
-	    {
-	      tree t = c_common_type_for_mode (TYPE_MODE (type),
-					       TYPE_UNSIGNED (type));
-	      if (type != t)
-		{
-		  type = t;
-		  goto iagain;
-		}
-
-	      if (TYPE_PRECISION (type) == 128)
-		write_char (TYPE_UNSIGNED (type) ? 'o' : 'n');
-	      else
-		{
-		  /* Allow for cases where TYPE is not one of the shared
-		     integer type nodes and write a "vendor extended builtin
-		     type" with a name the form intN or uintN, respectively.
-		     Situations like this can happen if you have an
-		     __attribute__((__mode__(__SI__))) type and use exotic
-		     switches like '-mint8' on AVR.  Of course, this is
-		     undefined by the C++ ABI (and '-mint8' is not even
-		     Standard C conforming), but when using such special
-		     options you're pretty much in nowhere land anyway.  */
-		  const char *prefix;
-		  char prec[11];	/* up to ten digits for an unsigned */
-
-		  prefix = TYPE_UNSIGNED (type) ? "uint" : "int";
-		  sprintf (prec, "%u", (unsigned) TYPE_PRECISION (type));
-		  write_char ('u');	/* "vendor extended builtin type" */
-		  write_unsigned_number (strlen (prefix) + strlen (prec));
-		  write_string (prefix);
-		  write_string (prec);
-		}
-	    }
-	}
-      break;
-
-    case REAL_TYPE:
-      if (type == float_type_node)
-	write_char ('f');
-      else if (type == double_type_node)
-	write_char ('d');
-      else if (type == long_double_type_node)
-	write_char ('e');
-      else if (type == dfloat32_type_node)
-	write_string ("Df");
-      else if (type == dfloat64_type_node)
-	write_string ("Dd");
-      else if (type == dfloat128_type_node)
-	write_string ("De");
-      else
-	gcc_unreachable ();
-      break;
-
-    case FIXED_POINT_TYPE:
-      write_string ("DF");
-      if (GET_MODE_IBIT (TYPE_MODE (type)) > 0)
-	write_unsigned_number (GET_MODE_IBIT (TYPE_MODE (type)));
-      if (type == fract_type_node
-	  || type == sat_fract_type_node
-	  || type == accum_type_node
-	  || type == sat_accum_type_node)
-	write_char ('i');
-      else if (type == unsigned_fract_type_node
-	       || type == sat_unsigned_fract_type_node
-	       || type == unsigned_accum_type_node
-	       || type == sat_unsigned_accum_type_node)
-	write_char ('j');
-      else if (type == short_fract_type_node
-	       || type == sat_short_fract_type_node
-	       || type == short_accum_type_node
-	       || type == sat_short_accum_type_node)
-	write_char ('s');
-      else if (type == unsigned_short_fract_type_node
-	       || type == sat_unsigned_short_fract_type_node
-	       || type == unsigned_short_accum_type_node
-	       || type == sat_unsigned_short_accum_type_node)
-	write_char ('t');
-      else if (type == long_fract_type_node
-	       || type == sat_long_fract_type_node
-	       || type == long_accum_type_node
-	       || type == sat_long_accum_type_node)
-	write_char ('l');
-      else if (type == unsigned_long_fract_type_node
-	       || type == sat_unsigned_long_fract_type_node
-	       || type == unsigned_long_accum_type_node
-	       || type == sat_unsigned_long_accum_type_node)
-	write_char ('m');
-      else if (type == long_long_fract_type_node
-	       || type == sat_long_long_fract_type_node
-	       || type == long_long_accum_type_node
-	       || type == sat_long_long_accum_type_node)
-	write_char ('x');
-      else if (type == unsigned_long_long_fract_type_node
-	       || type == sat_unsigned_long_long_fract_type_node
-	       || type == unsigned_long_long_accum_type_node
-	       || type == sat_unsigned_long_long_accum_type_node)
-	write_char ('y');
-      else
-	sorry ("mangling unknown fixed point type");
-      write_unsigned_number (GET_MODE_FBIT (TYPE_MODE (type)));
-      if (TYPE_SATURATING (type))
-	write_char ('s');
-      else
-	write_char ('n');
-      break;
-
-    default:
-      gcc_unreachable ();
+          prefix = TYPE_UNSIGNED(type) ? "uint" : "int";
+          sprintf(prec, "%u", (unsigned)TYPE_PRECISION(type));
+          write_char('u');	/* "vendor extended builtin type" */
+          write_unsigned_number(strlen(prefix) + strlen(prec));
+          write_string(prefix);
+          write_string(prec);
+        }
+      }
     }
+    break;
+
+  case REAL_TYPE:
+    if (type == float_type_node)
+      write_char('f');
+    else if (type == double_type_node)
+      write_char('d');
+    else if (type == long_double_type_node)
+      write_char('e');
+    else if (type == dfloat32_type_node)
+      write_string("Df");
+    else if (type == dfloat64_type_node)
+      write_string("Dd");
+    else if (type == dfloat128_type_node)
+      write_string("De");
+    else {
+      char prec[11];
+      sprintf(prec, "real%u", (unsigned)TYPE_PRECISION(type));
+      write_string(prec);
+      //error("Could not find REAL_TYPE %s...", TYPE_NAME(type));
+      //gcc_unreachable();
+    }
+    break;
+
+  case FIXED_POINT_TYPE:
+    write_string("DF");
+    if (GET_MODE_IBIT(TYPE_MODE(type)) > 0)
+      write_unsigned_number(GET_MODE_IBIT(TYPE_MODE(type)));
+    if (type == fract_type_node
+      || type == sat_fract_type_node
+      || type == accum_type_node
+      || type == sat_accum_type_node)
+      write_char('i');
+    else if (type == unsigned_fract_type_node
+      || type == sat_unsigned_fract_type_node
+      || type == unsigned_accum_type_node
+      || type == sat_unsigned_accum_type_node)
+      write_char('j');
+    else if (type == short_fract_type_node
+      || type == sat_short_fract_type_node
+      || type == short_accum_type_node
+      || type == sat_short_accum_type_node)
+      write_char('s');
+    else if (type == unsigned_short_fract_type_node
+      || type == sat_unsigned_short_fract_type_node
+      || type == unsigned_short_accum_type_node
+      || type == sat_unsigned_short_accum_type_node)
+      write_char('t');
+    else if (type == long_fract_type_node
+      || type == sat_long_fract_type_node
+      || type == long_accum_type_node
+      || type == sat_long_accum_type_node)
+      write_char('l');
+    else if (type == unsigned_long_fract_type_node
+      || type == sat_unsigned_long_fract_type_node
+      || type == unsigned_long_accum_type_node
+      || type == sat_unsigned_long_accum_type_node)
+      write_char('m');
+    else if (type == long_long_fract_type_node
+      || type == sat_long_long_fract_type_node
+      || type == long_long_accum_type_node
+      || type == sat_long_long_accum_type_node)
+      write_char('x');
+    else if (type == unsigned_long_long_fract_type_node
+      || type == sat_unsigned_long_long_fract_type_node
+      || type == unsigned_long_long_accum_type_node
+      || type == sat_unsigned_long_long_accum_type_node)
+      write_char('y');
+    else
+      sorry("mangling unknown fixed point type");
+    write_unsigned_number(GET_MODE_FBIT(TYPE_MODE(type)));
+    if (TYPE_SATURATING(type))
+      write_char('s');
+    else
+      write_char('n');
+    break;
+
+  default:
+    gcc_unreachable();
+  }
 }
 
 /* Non-terminal <function-type>.  NODE is a FUNCTION_TYPE or

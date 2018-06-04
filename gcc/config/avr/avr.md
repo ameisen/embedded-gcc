@@ -260,7 +260,7 @@
 (define_mode_iterator MOVMODE [QI QQ UQQ
                                HI HQ UHQ HA UHA
                                SI SQ USQ SA USA
-                               SF PSI])
+                               SF PSI PSF HF])
 
 ;; Supported ordered modes that are 2, 3, 4 bytes wide
 (define_mode_iterator ORDERED234 [HI SI PSI
@@ -268,7 +268,7 @@
                                   SQ USQ SA USA])
 
 ;; Post-reload split of 3, 4 bytes wide moves.
-(define_mode_iterator SPLIT34 [SI SF PSI
+(define_mode_iterator SPLIT34 [SI SF PSI PSF
                                SQ USQ SA USA])
 
 ;; Define code iterators
@@ -400,7 +400,7 @@
    DI CDI DA UDA DQ UDQ
    TA UTA
    SF SC
-   PSI])
+   PSI PSF HF PSC HC])
 
 (define_expand "push<mode>1"
   [(match_operand:MPUSH 0 "" "")]
@@ -626,6 +626,7 @@
 ;; "movsi" "movsq" "movusq" "movsa" "movusa"
 ;; "movsf"
 ;; "movpsi"
+;; "movpsf"
 (define_expand "mov<mode>"
   [(set (match_operand:MOVMODE 0 "nonimmediate_operand" "")
         (match_operand:MOVMODE 1 "general_operand" ""))]
@@ -987,6 +988,82 @@
   }
   [(set_attr "length" "8")
    (set_attr "adjust_len" "reload_in32")
+   (set_attr "cc" "clobber")])
+
+;; fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+;; move floating point numbers (16 bit)
+
+(define_insn "*movhf"
+  [(set (match_operand:HF 0 "nonimmediate_operand" "=r,r,r ,Qm,!d,r")
+        (match_operand:HF 1 "nox_general_operand"   "r,G,Qm,rG,F ,F"))]
+  "register_operand (operands[0], HFmode)
+   || reg_or_0_operand (operands[1], HFmode)"
+  {
+    return output_movhi (insn, operands, NULL);
+  }
+  [(set_attr "length" "2,2,8,9,4,10")
+   (set_attr "adjust_len" "mov16")
+   (set_attr "cc" "none,none,clobber,clobber,none,clobber")])
+
+(define_peephole2 ; *reload_inhf
+  [(match_scratch:HI 2 "d")
+   (set (match_operand:HF 0 "l_register_operand" "")
+        (match_operand:HF 1 "const_double_operand" ""))
+   (match_dup 2)]
+  "operands[1] != CONST0_RTX (HFmode)"
+  [(parallel [(set (match_dup 0)
+                   (match_dup 1))
+              (clobber (match_dup 2))])])
+
+;; '*' because it is not used in rtl generation.
+(define_insn "*reload_inhf"
+  [(set (match_operand:HF 0 "register_operand" "=r")
+        (match_operand:HF 1 "const_double_operand" "F"))
+   (clobber (match_operand:HI 2 "register_operand" "=&d"))]
+  "reload_completed"
+  {
+    return output_reload_inhi (operands, operands[2], NULL);
+  }
+  [(set_attr "length" "4")
+   (set_attr "adjust_len" "reload_in16")
+   (set_attr "cc" "clobber")])
+
+;; fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+;; move floating point numbers (24 bit)
+
+(define_insn "*movpsf"
+  [(set (match_operand:PSF 0 "nonimmediate_operand" "=r,r,r ,Qm,!d,r")
+        (match_operand:PSF 1 "nox_general_operand"   "r,G,Qm,rG,F ,F"))]
+  "register_operand (operands[0], PSFmode)
+   || reg_or_0_operand (operands[1], PSFmode)"
+  {
+    return avr_out_movpsipsf (insn, operands, NULL);
+  }
+  [(set_attr "length" "3,3,8,9,4,10")
+   (set_attr "adjust_len" "mov24")
+   (set_attr "cc" "none,none,clobber,clobber,none,clobber")])
+
+(define_peephole2 ; *reload_inpsf
+  [(match_scratch:QI 2 "d")
+   (set (match_operand:PSF 0 "l_register_operand" "")
+        (match_operand:PSF 1 "const_double_operand" ""))
+   (match_dup 2)]
+  "operands[1] != CONST0_RTX (PSFmode)"
+  [(parallel [(set (match_dup 0)
+                   (match_dup 1))
+              (clobber (match_dup 2))])])
+
+;; '*' because it is not used in rtl generation.
+(define_insn "*reload_inpsf"
+  [(set (match_operand:PSF 0 "register_operand" "=r")
+        (match_operand:PSF 1 "const_double_operand" "F"))
+   (clobber (match_operand:QI 2 "register_operand" "=&d"))]
+  "reload_completed"
+  {
+    return avr_out_reload_inpsi (operands, operands[2], NULL);
+  }
+  [(set_attr "length" "6")
+   (set_attr "adjust_len" "reload_in24")
    (set_attr "cc" "clobber")])
 
 ;;=========================================================================
@@ -4241,6 +4318,26 @@
   [(set_attr "length" "1,2")
    (set_attr "cc" "set_n,clobber")])
 
+(define_insn "abspsf2"
+  [(set (match_operand:PSF 0 "register_operand" "=d,r")
+        (abs:PSF (match_operand:PSF 1 "register_operand" "0,0")))]
+  ""
+  "@
+	andi %C0,0x7f
+	clt\;bld %C0,7"
+  [(set_attr "length" "1,2")
+   (set_attr "cc" "set_n,clobber")])
+
+(define_insn "abshf2"
+  [(set (match_operand:HF 0 "register_operand" "=d,r")
+        (abs:HF (match_operand:HF 1 "register_operand" "0,0")))]
+  ""
+  "@
+	andi %B0,0x7f
+	clt\;bld %B0,7"
+  [(set_attr "length" "1,2")
+   (set_attr "cc" "set_n,clobber")])
+
 ;; 0 - x  0 - x  0 - x  0 - x  0 - x  0 - x  0 - x  0 - x  0 - x  0 - x  0 - x
 ;; neg
 
@@ -4301,6 +4398,26 @@
   "@
 	subi %D0,0x80
 	bst %D0,7\;com %D0\;bld %D0,7\;com %D0"
+  [(set_attr "length" "1,4")
+   (set_attr "cc" "set_n,set_n")])
+
+(define_insn "negpsf2"
+  [(set (match_operand:PSF 0 "register_operand" "=d,r")
+	(neg:PSF (match_operand:PSF 1 "register_operand" "0,0")))]
+  ""
+  "@
+	subi %C0,0x80
+	bst %C0,7\;com %C0\;bld %C0,7\;com %C0"
+  [(set_attr "length" "1,4")
+   (set_attr "cc" "set_n,set_n")])
+
+(define_insn "neghf2"
+  [(set (match_operand:HF 0 "register_operand" "=d,r")
+	(neg:HF (match_operand:HF 1 "register_operand" "0,0")))]
+  ""
+  "@
+	subi %B0,0x80
+	bst %B0,7\;com %B0\;bld %B0,7\;com %B0"
   [(set_attr "length" "1,4")
    (set_attr "cc" "set_n,set_n")])
 
@@ -6323,6 +6440,26 @@
                    UNSPEC_COPYSIGN))]
   ""
   "bst %D2,7\;bld %D0,7"
+  [(set_attr "length" "2")
+   (set_attr "cc" "none")])
+
+(define_insn "copysignpsf3"
+  [(set (match_operand:PSF 0 "register_operand"             "=r")
+        (unspec:PSF [(match_operand:PSF 1 "register_operand"  "0")
+                    (match_operand:PSF 2 "register_operand"  "r")]
+                   UNSPEC_COPYSIGN))]
+  ""
+  "bst %C2,7\;bld %C0,7"
+  [(set_attr "length" "2")
+   (set_attr "cc" "none")])
+
+(define_insn "copysignhf3"
+  [(set (match_operand:HF 0 "register_operand"             "=r")
+        (unspec:HF [(match_operand:HF 1 "register_operand"  "0")
+                    (match_operand:HF 2 "register_operand"  "r")]
+                   UNSPEC_COPYSIGN))]
+  ""
+  "bst %B2,7\;bld %B0,7"
   [(set_attr "length" "2")
    (set_attr "cc" "none")])
 

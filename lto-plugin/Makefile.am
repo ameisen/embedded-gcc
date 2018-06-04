@@ -36,11 +36,11 @@ liblto_plugin_la_LDFLAGS += \
 liblto_plugin_la_DEPENDENCIES = \
 	$(if $(wildcard $(libiberty_noasan)),$(libiberty_noasan), \
 	$(if $(wildcard $(libiberty_pic)),$(libiberty_pic),))
-LTLDFLAGS = $(shell $(SHELL) $(top_srcdir)/../libtool-ldflags $(LDFLAGS))
-liblto_plugin_la_LINK = $(LIBTOOL) --tag=CC $(AM_LIBTOOLFLAGS) \
-	$(LIBTOOLFLAGS) --mode=link $(CCLD) $(AM_CFLAGS) $(CFLAGS) \
-	$(liblto_plugin_la_LDFLAGS) $(LTLDFLAGS) -o $@
-
+LTLDFLAGS = $(shell $(SHELL) $(top_srcdir)/../libtool-ldflags $(filter-out '--static' --static '-static' -static,$(LDFLAGS)))
+liblto_plugin_la_LINK = $(LIBTOOL) --tag=CC $(filter-out '--static' --static '-static' -static,$(AM_LIBTOOLFLAGS)) \
+	$(filter-out '--static' --static '-static' -static,$(LIBTOOLFLAGS)) --mode=link $(CCLD) $(filter-out '--static' --static '-static' -static,$(AM_CFLAGS)) $(filter-out '--static' --static '-static' -static,$(CFLAGS)) \
+	$(filter-out '--static' --static '-static' -static,$(liblto_plugin_la_LDFLAGS)) $(filter-out '--static' --static '-static' -static,$(LTLDFLAGS)) -o $@
+	
 all-local: $(in_gcc_libs)
 
 $(in_gcc_libs) : $(gcc_build_dir)/%: %
@@ -48,5 +48,5 @@ $(in_gcc_libs) : $(gcc_build_dir)/%: %
 	  echo WARNING: $* is static, not copying to $@ >&2 ; \
 	else \
 	  $(mkinstalldirs) $(gcc_build_dir) && \
-	  $(LIBTOOL) $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=install $(INSTALL) $(INSTALL_STRIP_FLAG) $* `pwd`/$@ ; \
+	  $(LIBTOOL) $(filter-out '--static' --static '-static' -static,$(AM_LIBTOOLFLAGS)) $(filter-out '--static' --static '-static' -static,$(LIBTOOLFLAGS)) --mode=install $(INSTALL) $(INSTALL_STRIP_FLAG) $* `pwd`/$@ ; \
 	fi

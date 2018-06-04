@@ -3055,6 +3055,29 @@ const struct real_format ieee_single_format =
     "ieee_single"
   };
 
+const struct real_format fast_single_format =
+{
+  encode_ieee_single,
+  decode_ieee_single,
+  2,
+  24,
+  24,
+  -125,
+  129,
+  -1,
+  -1,
+  0,
+  false,
+  true,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  "fast_single"
+};
+
 const struct real_format mips_single_format =
   {
     encode_ieee_single,
@@ -4823,6 +4846,30 @@ const struct real_format ieee_half_format =
     "ieee_half"
   };
 
+/* Half-precision format.  */
+const struct real_format fast_half_format =
+{
+  encode_ieee_half,
+  decode_ieee_half,
+  2,
+  11,
+  11,
+  -13,
+  17,
+  15,
+  15,
+  0,
+  false,
+  true,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  "fast_half"
+};
+
 /* ARM's alternative half-precision format, similar to IEEE but with
    no reserved exponent value for NaNs and infinities; rather, it just
    extends the range of exponents by one.  */
@@ -4848,7 +4895,211 @@ const struct real_format arm_half_format =
     false,
     "arm_half"
   };
-
+
+static const unsigned long float24_bits = 24;
+static const unsigned long float24_significand = 17;
+static const unsigned long float24_exponent = float24_bits - float24_significand;
+static const unsigned long float24_exponent_bias = (1ul << (float24_exponent - 1)) - 1;
+
+/* Encode 3/4-precision floats.  This routine is used both for the IEEE
+ARM alternative encodings.  */
+static void
+encode_ieee_24(const struct real_format *fmt, long *buf,
+  const REAL_VALUE_TYPE *r)
+{
+  static const unsigned long bits = float24_bits;
+  static const unsigned long significand = float24_significand;
+  static const unsigned long exponent = bits - significand;
+
+  unsigned long image, sig, exp;
+  unsigned long sign = r->sign;
+  bool denormal = (r->sig[SIGSZ - 1] & SIG_MSB) == 0;
+
+  image = sign << (bits -1);
+  sig = (r->sig[SIGSZ - 1] >> (HOST_BITS_PER_LONG - significand)) & ((1ul << significand) - 1);
+
+  switch (r->cl)
+  {
+  case rvc_zero:
+    break;
+
+  case rvc_inf:
+    if (fmt->has_inf)
+      image |= ((1ul << exponent) - 1) << (significand - 1);
+    else
+      image |= ((1ul << significand) - 1);
+    break;
+
+  case rvc_nan:
+    if (fmt->has_nans)
+    {
+      if (r->canonical)
+        sig = (fmt->canonical_nan_lsbs_set ? (1 << (significand - 2)) - 1 : 0);
+      if (r->signalling == fmt->qnan_msb_set)
+        sig &= ~(1 << (significand - 2));
+      else
+        sig |= 1 << (significand - 2);
+      if (sig == 0)
+        sig = 1 << (significand - 2);
+
+      image |= ((1ul << exponent) - 1) << (significand - 1);
+      image |= sig;
+    }
+    else
+      image |= ((1ul << significand) - 1);
+    break;
+
+  case rvc_normal:
+    /* Recall that IEEE numbers are interpreted as 1.F x 2**exp,
+    whereas the intermediate representation is 0.F x 2**exp.
+    Which means we're off by one.  */
+    if (denormal)
+      exp = 0;
+    else
+      exp = REAL_EXP(r) + ((1ul << exponent) - 1) - 1;
+    image |= exp << (significand - 1);
+    image |= sig;
+    break;
+
+  default:
+    gcc_unreachable();
+  }
+
+  buf[0] = image;
+}
+
+//half:   11  5
+//24:     17  7
+//single: 24  8
+
+/* Decode 3/4-precision floats.  This routine is used both for the IEEE
+ARM alternative encodings.  */
+static void
+decode_ieee_24(const struct real_format *fmt, REAL_VALUE_TYPE *r,
+  const long *buf)
+{
+  static const unsigned long bits = float24_bits;
+  static const unsigned long significand = float24_significand;
+  static const unsigned long exponent = bits - significand;
+
+  unsigned long image = buf[0] & ((1ul << bits) - 1);
+  bool sign = (image >> (bits - 1)) & 1;
+  int exp = (image >> (significand - 1)) & ((1ul << exponent) - 1);
+
+  memset(r, 0, sizeof(*r));
+  image <<= HOST_BITS_PER_LONG - significand;
+  image &= ~SIG_MSB;
+
+  if (exp == 0)
+  {
+    if (image && fmt->has_denorm)
+    {
+      r->cl = rvc_normal;
+      r->sign = sign;
+      SET_REAL_EXP(r, ~((1ul << exponent) - 1) | 0x2ul);
+      r->sig[SIGSZ - 1] = image << 1;
+      normalize(r);
+    }
+    else if (fmt->has_signed_zero)
+      r->sign = sign;
+  }
+  else if (exp == ((1ul << exponent) - 1) && (fmt->has_nans || fmt->has_inf))
+  {
+    if (image)
+    {
+      r->cl = rvc_nan;
+      r->sign = sign;
+      r->signalling = (((image >> (HOST_BITS_PER_LONG - 2)) & 1)
+        ^ fmt->qnan_msb_set);
+      r->sig[SIGSZ - 1] = image;
+    }
+    else
+    {
+      r->cl = rvc_inf;
+      r->sign = sign;
+    }
+  }
+  else
+  {
+    r->cl = rvc_normal;
+    r->sign = sign;
+    SET_REAL_EXP(r, exp - ((1ul << significand) - 1) + 1);
+    r->sig[SIGSZ - 1] = image | SIG_MSB;
+  }
+}
+
+/* 3/4-precision format.  */
+const struct real_format ieee_24_format =
+{
+  encode_ieee_24,
+  decode_ieee_24,
+  2,
+  float24_significand,
+  float24_significand,
+  int((~float24_exponent_bias) | 0x3u),
+  float24_exponent_bias + 1,
+  float24_bits - 1,
+  float24_bits - 1,
+  float24_bits,
+  false,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  false,
+  "ieee_float24"
+};
+
+/* 3/4-precision format, fast.  */
+const struct real_format fast_24_format =
+{
+  encode_ieee_24,
+  decode_ieee_24,
+  2,
+  float24_significand,
+  float24_significand,
+  int((~float24_exponent_bias) | 0x3u),
+  float24_exponent_bias + 2,
+  -1,
+  -1,
+  0,
+  false,
+  true,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  "fast_float24"
+};
+
+/* ARM's alternative half-precision format */
+const struct real_format arm_24_format =
+{
+  encode_ieee_24,
+  decode_ieee_24,
+  2,
+  float24_significand,
+  float24_significand,
+  int((~float24_exponent_bias) | 0x3u),
+  float24_exponent_bias + 2,
+  float24_bits - 1,
+  float24_bits - 1,
+  0,
+  false,
+  true,
+  false,
+  false,
+  true,
+  true,
+  false,
+  false,
+  "arm_float24"
+};
+
 /* A synthetic "format" for internal arithmetic.  It's the size of the
    internal significand minus the two bits needed for proper rounding.
    The encode and decode routines exist only to satisfy our paranoia

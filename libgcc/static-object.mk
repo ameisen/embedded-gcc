@@ -17,6 +17,12 @@ $(base)$(objext): $o
 	$(gcc_compile) $(c_flags-$<) -c $< $(vis_hide)
 
 else
+ifeq ($(suffix $o),.cpp)
+
+$(base)$(objext): $o
+	$(gcc_compile) --std=gnu++17 $(c_flags-$<) -c $< $(vis_hide)
+	
+else
 
 ifneq ($(suffix $o),.S)
 ifneq ($(suffix $o),.asm)
@@ -34,5 +40,7 @@ $(base).vis: $(base)_s$(objext)
 
 $(base)_s$(objext): $o
 	$(gcc_s_compile) -c $(as_flags-$<) $<
-
+	
+endif
+	
 endif
