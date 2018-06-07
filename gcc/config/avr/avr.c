@@ -20,7 +20,7 @@
 
 #define EXPERIMENTAL_VOLATILE 1
 #define EXPERIMENTAL_COMPARISON 1
-#define DEBUG_WARNINGS 1
+#define DEBUG_WARNINGS 0
 
 #define IN_TARGET_CODE 1
 
@@ -65,31 +65,68 @@
 /* This file should be included last.  */
 #include "target-def.h"
 
+static FILE *get_debug_file()
+{
+  static const char debug_filename[] = "D:\\gcc_debug.txt";
+  static FILE *debug_file = NULL;
+  if (!debug_file)
+  {
+    debug_file = fopen(debug_filename, "a");
+  }
+  return debug_file;
+}
+
 #if DEBUG_WARNINGS
-# define debug_warn(op, str, ...) \
-{ \
-  tree decl = SYMBOL_REF_DECL(op); \
-  bool found_location = false; \
-  location_t location; \
-  if (decl) \
-  { \
-    location = DECL_SOURCE_LOCATION(decl); \
-    if (location != UNKNOWN_LOCATION) \
-    { \
-      found_location = true; \
-    } \
-  } \
-  if (!found_location) \
-  { \
-    location = curr_insn_location(); \
-  } \
-  char buffer[2048] = {'\0'}; \
-  sprintf(buffer, str, ##__VA_ARGS__); \
-  warning_at(location, 0, buffer); \
+template <typename... Args>
+void debug_warn(unsigned int tabs, rtx op, const char *str, Args&&... args)
+{
+  tree decl = SYMBOL_REF_DECL(op);
+  bool found_location = false;
+  location_t location;
+  if (decl)
+  {
+    location = DECL_SOURCE_LOCATION(decl);
+    if (location != UNKNOWN_LOCATION)
+    {
+      found_location = true;
+    }
+  }
+  if (!found_location)
+  {
+    location = curr_insn_location();
+  }
+  char buffer[2048] = { '\0' };
+  for (unsigned i = 0; i < tabs; ++i)
+  {
+    buffer[i] = '\t';
+  }
+  sprintf(buffer + tabs, str, std::forward<Args>(args)...);
+  warning_at(location, 0, buffer);
+  if (get_debug_file()) fprintf(get_debug_file(), "%s(%u): %s\n", LOCATION_FILE(location), LOCATION_LINE(location), buffer);
 }
 #else
-# define debug_Warn(op, str, ...)
+template <typename... Args>
+void debug_warn(unsigned int tabs, rtx op, const char *str, Args... args) {}
 #endif
+
+void print_tabs(FILE * __restrict__ fp, unsigned int tabs)
+{
+  for (unsigned int i = 0; i < tabs; ++i)
+  {
+    if (get_debug_file()) fprintf(get_debug_file(), "\t");
+    fprintf(fp, "\t");
+  }
+}
+
+void print_rtx(rtx x)
+{
+  print_rtl(stderr, x);
+  if (get_debug_file())
+  {
+    print_rtl(get_debug_file(), x);
+    fprintf(get_debug_file(), "\n");
+  }
+}
 
 /* Maximal allowed offset for an address in the LD command */
 #define MAX_LD_OFFSET(MODE) (64 - (signed)GET_MODE_SIZE (MODE))
@@ -367,36 +404,142 @@ static const pass_data avr_pass_data_casesi =
   0              // todo_flags_finish
 };
 
-//template <bool mask>
-//unsigned int extract_address(rtx x)
-//{
-//  x = plus_constant(GET_MODE(x), x, 0);
-//
-//  switch (GET_CODE(x))
-//  {
-//  case REG:
-//    return -1;
-//  case PRE_DEC:
-//    return -1;
-//  case POST_INC:
-//    return -1;
-//  default:
-//    if (CONSTANT_ADDRESS_P(x))
-//    {
-//      if (GET_CODE(x) == CONST)
-//      {
-//        x = XEXP(x, 0);
-//        if (GET_CODE(x) == PLUS && CONST_INT_P(XEXP(x, 1)))
-//        {
-//          x = XEXP(x, 0);
-//        }
-//      }
-//    }
-//    else
-//    {
-//    }
-//  }
-//}
+unsigned int extract_address(rtx x)
+{
+  x = *strip_address_mutations(&x);
+
+  unsigned int tabs = 0;
+  rtx orig = x;
+  debug_warn(tabs, orig, "extract_address (dump on next line)");
+
+  print_tabs(stderr, tabs);
+  //print_rtx(orig);
+  //fprintf(stderr, "\n");
+
+  tree expr = NULL;
+
+  // Otherwise we may need to make an attempt at resolving it?
+  while (!CONST_INT_P(x))
+  {
+    tabs = 1;
+    debug_warn(tabs, orig, "!CONST_INT_P(x)");
+    switch (GET_CODE(x))
+    {
+    case MEM:
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == MEM");
+      if (MEM_EXPR(x))
+      {
+        expr = MEM_EXPR(x);
+      }
+      x = XEXP(x, 0);
+      break;
+    case SYMBOL_REF:
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == SYMBOL_REF");
+      // Presently, let's just presume that a symbol reference is _never_ going to be an IO register.
+      // This may change in the future?
+      return 0x1000; // arbitrary value.
+      //break;
+    case REG: {
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == REG");
+      if (REG_EXPR(x))
+      {
+        expr = REG_EXPR(x);
+      }
+      if (!expr)
+      {
+        debug_warn(tabs + 2, orig, "REG_EXPR(x) == null");
+        return -1;
+      }
+      switch (TREE_CODE(expr))
+      {
+      case LABEL_DECL:
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == LABEL_DECL");
+        return 0x1000;
+      case CONST_DECL: {
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == CONST_DECL");
+        tree expr_decl = DECL_INITIAL(expr);
+        if (TREE_CODE(expr_decl) != INTEGER_CST)
+        {
+          return 0x1000; // wtf?
+        }
+        return TREE_INT_CST_LOW(expr_decl);
+      }
+      case RESULT_DECL:
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == RESULT_DECL");
+        return 0x1000;
+      case VAR_DECL: {
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == VAR_DECL");
+        tree expr_decl = DECL_INITIAL(expr);
+        if (expr_decl && expr_decl != error_mark_node)
+        {
+          if (TREE_CODE(expr_decl) != INTEGER_CST)
+          {
+            return 0x1000; // wtf? Is it a float or something?
+          }
+          return TREE_INT_CST_LOW(expr_decl);
+        }
+        return 0x1000; // todo
+      }
+      case PARM_DECL:
+        // parameters should never point directly to an IO register.
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == PARM_DECL");
+        return 0x1000;
+      case FIELD_DECL:
+        // TODO : I can envision times where this _won't_ be correct.
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == FIELD_DECL");
+        return 0x1000;
+
+      case DEBUG_EXPR_DECL:
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == DEBUG_EXPR_DECL");
+        return 0x1000;
+      case TYPE_DECL:
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == TYPE_DECL");
+        return 0x1000;
+      case NAMESPACE_DECL:
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == NAMESPACE_DECL");
+        return 0x1000;
+      default:
+        debug_warn(tabs + 2, orig, "TREE_CODE(expr) == default");
+        return 0x1000;
+      }
+      return -1;
+    }
+
+    case PRE_DEC:
+      debug_warn(tabs + 1, orig, "***********************************************");
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == PRE_DEC");
+      return -1;
+    case POST_INC:
+      debug_warn(tabs + 1, orig, "***********************************************");
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == POST_INC");
+      return -1;
+    case PLUS:
+      debug_warn(tabs + 1, orig, "***********************************************");
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == PLUS");
+      return -1;
+    case CONST:
+      debug_warn(tabs + 1, orig, "***********************************************");
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == CONST");
+      return -1;
+    default:
+      debug_warn(tabs + 1, orig, "***********************************************");
+      debug_warn(tabs + 1, orig, "GET_CODE(x) == default");
+      return -1;
+    }
+
+    if (!x)
+    {
+      debug_warn(tabs + 1, orig, "***********************************************");
+      debug_warn(tabs, orig, "x == null");
+      return -1;
+    }
+  }
+
+  debug_warn(tabs, orig, "Loop End - CONST_INT_P(x) != 0");
+  unsigned int address = UINTVAL(x);
+  debug_warn(tabs, orig, "Address Extracted: %X", address);
+  return address;
+}
 
 template <bool mask>
 bool validate_address_io(rtx x, unsigned int address)
@@ -406,22 +549,22 @@ bool validate_address_io(rtx x, unsigned int address)
   // If the address is within the program's data section, it is impossible for it to be in the IO range.
   // As said above, we can likely do work with hints/assumptions the compiler makes based upon this even
   // if we do not know the exact value of the pointer. I have no idea how to actually do that, though.
-  if (address >= (unsigned)avr_arch->default_data_section_start)
-  {
-    debug_warn(x, "Volatile Access Simplified Case 0 (%u >= %u) - %s", address, (unsigned)avr_arch->default_data_section_start, name_str);
-    return false;
-  }
+  //if (address >= (unsigned)avr_arch->default_data_section_start)
+  //{
+  //  debug_warn(0, x, "Volatile Access Simplified Case 0 (%u >= %u) - %s", address, (unsigned)avr_arch->default_data_section_start, name_str);
+  //  return false;
+  //}
 
   // TODO DC_MMK : implement address tests for different AVR versions.
-
-  if (strcmp(avr_arch->name, "avr6") == 0) // AVR6 : atmega256rfr2, atmega2560, atmega2561, atmega2564rfr2
+  // TODO at the moment for debugging presuming ALL avrs are same.
+  //if (strcmp(avr_arch->name, "avr6") == 0) // AVR6 : atmega256rfr2, atmega2560, atmega2561, atmega2564rfr2
   {
     // AVR6
 
     // GPRs - 32 1-byte registers.
     if (address < 0x20)
     {
-      debug_warn(x, "Volatile Access Simplified Case 1 (%u < 0x20) - %s", address, name_str);
+      debug_warn(0, x, "Volatile Access Simplified Case 1 (%u < 0x20) - %s", address, name_str);
       return false;
     }
 
@@ -468,7 +611,7 @@ bool validate_address_io(rtx x, unsigned int address)
       {
         if ((address & test_address) != 0)
         {
-          debug_warn(x, "Potential IO Register Access Detected (%u & %u != 0) - %s", address, test_address, name_str);
+          debug_warn(0, x, "Potential IO Register Access Detected (%u & %u != 0) - %s", address, test_address, name_str);
           return true;
         }
       }
@@ -476,17 +619,17 @@ bool validate_address_io(rtx x, unsigned int address)
       {
         if (address == test_address)
         {
-          debug_warn(x, "IO Register Access Detected (%u == %u) - %s", address, test_address, name_str);
+          debug_warn(0, x, "IO Register Access Detected (%u == %u) - %s", address, test_address, name_str);
           return true;
         }
       }
     }
 
-    debug_warn(x, "Volatile Access Simplified Case 2 (%u) - %s", address, name_str);
+    debug_warn(0, x, "Volatile Access Simplified Case 2 (%u) - %s", address, name_str);
     return false;
   }
 
-  debug_warn(x, "Unknown AVR arch? (%u) - %s", address, name_str);
+  debug_warn(0, x, "Unknown AVR arch? \'%s\' (%u) - %s", avr_arch->name, address, name_str);
   return true;
 }
 
@@ -496,7 +639,7 @@ static bool is_io_register(rtx x)
   rtx orig_x = x;
 
   // IO registers are always volatile. If it's not volatile, it cannot be an IO register.
-  if (MEM_VOLATILE_P(x) != 1)
+  if (!MEM_VOLATILE_P(x))
   {
     return false;
   }
@@ -506,48 +649,48 @@ static bool is_io_register(rtx x)
 #else
 
   // Unsure what exactly this does, but it's used in avr_address_tiny_absdata_p, which tries to resolve the address as well.
-  if (CONST == GET_CODE(x))
-  {
-    x = XEXP(XEXP(x, 0), 0);
-  }
+  //if (CONST == GET_CODE(x))
+  //{
+  //  x = XEXP(XEXP(x, 0), 0);
+  //}
 
   // strip?
-  x = *strip_address_mutations(&x);
+  //x = *strip_address_mutations(&x);
   //x = convert_memory_address(GET_MODE(x), x);
 
   // IO registers must be pointed to via SRAM or MEMX pointers. A FLASHn/PROGMEM pointer cannot point to IO registers.
   if (MEM_ADDR_SPACE(x) != ADDR_SPACE_RAM && MEM_ADDR_SPACE(x) != ADDR_SPACE_MEMX)
   {
-    debug_warn(orig_x, "16-bit access not in relevant address space, must not be IO register.");
+    debug_warn(0, orig_x, "16-bit access not in relevant address space, must not be IO register.");
     return false;
   }
+
+  const unsigned int address = extract_address(x);
 
   // If the address is not constant, we cannot determine it's value presumably, and thus we must presume that it is potentially
   // an IO register. We can probably do better than this by looking at the hints/assumptions GCC makes to see that, if the address is
   // unknown, if it is potentially in the IO range. See the next test.
-  if (!CONSTANT_P(x) && !CONST_INT_P(x) && !CONST_WIDE_INT_P(x))
+  if (address == (unsigned int)-1)
   {
     // If it's not constant, we can try using something like nonzero bits or num_sign_bit_copies1.
-    unsigned HOST_WIDE_INT nzbits = nonzero_bits(x, GET_MODE(x));
-    if ((nzbits & 0xFFF) == 0xFFF) // TODO
-    {
-      debug_warn(orig_x, "Could not determine if 16-bit Volatile Access was for IO register");
-      debug_warn(orig_x, "Dump 1:");
-      print_rtl(stderr, orig_x);
-      debug_warn(orig_x, "Dump 2:");
-      print_rtl(stderr, x);
-      return true;
-    }
-
-    bool is_io = validate_address_io<true>(orig_x, nzbits);
-    return is_io;
+    //unsigned HOST_WIDE_INT nzbits = nonzero_bits(x, GET_MODE(x));
+    //if ((nzbits & 0xFFF) == 0xFFF) // TODO
+    //{
+    //  debug_warn(orig_x, "Could not determine if 16-bit Volatile Access was for IO register");
+    //  fprintf(stderr, "\n");
+    //  print_rtl(stderr, orig_x);
+    //  fprintf(stderr, "\n");
+    //  return true;
+    //}
+    //
+    //bool is_io = validate_address_io<true>(orig_x, nzbits);
+    //return is_io;
+    debug_warn(0, orig_x, "Could not determine if 16-bit Volatile Access was for IO register");
+    return true;
   }
 
-  // Get the address from the rtx, and start comparing it against known values.
-  const unsigned int address = UINTVAL(x);
 
-  bool is_io = validate_address_io<false>(orig_x, address);
-  return is_io;
+  return validate_address_io<false>(orig_x, address);
 #endif
 }
 
@@ -4477,7 +4620,6 @@ avr_out_movhi_r_mr_reg_disp_tiny (rtx_insn *insn, rtx op[], int *plen)
 static const char*
 avr_out_movhi_r_mr_pre_dec_tiny (rtx_insn *insn, rtx op[], int *plen)
 {
-  int mem_volatile_p = 0;
   rtx dest = op[0];
   rtx src = op[1];
   rtx base = XEXP (src, 0);
@@ -4485,7 +4627,7 @@ avr_out_movhi_r_mr_pre_dec_tiny (rtx_insn *insn, rtx op[], int *plen)
   // DC_MMK : TODO validate that this is actually needed or not.
   /* "volatile" forces reading low byte first, even if less efficient,
      for correct operation with 16-bit I/O registers.  */
-  mem_volatile_p = is_io_register(src) ? 1 : 0;
+  bool mem_volatile_p = is_io_register(src);
 
   if (reg_overlap_mentioned_p (dest, XEXP (base, 0)))
     fatal_insn ("incorrect insn:", insn);
@@ -4512,7 +4654,7 @@ out_movhi_r_mr (rtx_insn *insn, rtx op[], int *plen)
   // DC_MMK : TODO validate that this is actually needed or not.
   /* "volatile" forces reading low byte first, even if less efficient,
      for correct operation with 16-bit I/O registers.  */
-  int mem_volatile_p = is_io_register(src) ? 1 : 0;
+  bool mem_volatile_p = is_io_register(src);
 
   if (reg_base > 0)
     {
@@ -5832,7 +5974,7 @@ avr_out_movhi_mr_r_xmega (rtx_insn *insn, rtx op[], int *plen)
   // DC_MMK : TODO validate
   /* "volatile" forces writing low byte first, even if less efficient,
      for correct operation with 16-bit I/O registers like SP.  */
-  int mem_volatile_p = is_io_register(dest) ? 1 : 0;
+  bool mem_volatile_p = is_io_register(dest);
 
   if (CONSTANT_ADDRESS_P (base))
     {
@@ -5940,7 +6082,7 @@ avr_out_movhi_mr_r_reg_no_disp_tiny (rtx_insn *insn, rtx op[], int *plen)
   int reg_base = true_regnum (base);
   int reg_src = true_regnum (src);
   // DC_MMK : TODO consider making a new modifier for IO ports so not all volatile variables are impeded.
-  int mem_volatile_p = is_io_register(dest) ? 1 : 0;
+  bool mem_volatile_p = is_io_register(dest);
 
   if (reg_base == reg_src)
     {
@@ -6008,7 +6150,6 @@ out_movhi_mr_r (rtx_insn *insn, rtx op[], int *plen)
   rtx base = XEXP (dest, 0);
   int reg_base = true_regnum (base);
   int reg_src = true_regnum (src);
-  int mem_volatile_p;
 
   /* "volatile" forces writing high-byte first (no-xmega) resp.
      low-byte first (xmega) even if less efficient, for correct
@@ -6018,7 +6159,7 @@ out_movhi_mr_r (rtx_insn *insn, rtx op[], int *plen)
     return avr_out_movhi_mr_r_xmega (insn, op, plen);
 
   // DC_MMK : TODO
-  mem_volatile_p = is_io_register(dest) ? 1 : 0;
+  bool mem_volatile_p = is_io_register(dest);
 
   if (CONSTANT_ADDRESS_P (base))
     {
